@@ -36,7 +36,8 @@ class TestManager:
             
             # Fallback to a minimal test base
             class MinimalTestBase:
-                def log_test_info(self, message: str):                    print(f"[TEST INFO] {message}")
+                def log_test_info(self, message: str):
+                    print(f"[TEST INFO] {message}")
                 def log_test_error(self, message: str):
                     print(f"[TEST ERROR] {message}")
             

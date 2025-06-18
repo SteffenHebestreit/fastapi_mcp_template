@@ -86,7 +86,8 @@ def create_dynamic_routes(app, tool_manager: ToolManager) -> None:
                         "serverInfo": {
                             "name": "fileconverter-mcp",
                             "version": "1.0.0"
-                        },                        "tools": tool_definitions
+                        },
+                        "tools": tool_definitions
                     }
                 }
                 
