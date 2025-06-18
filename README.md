@@ -63,7 +63,7 @@ fastapi_mcp_template/
 ### **Dynamic Tool Loading**
 - **Zero Configuration**: Drop Python files in `tools/` and they're automatically discovered
 - **Hot Reloading**: Development mode automatically reloads tools when changed
-- **Dependency Isolation**: Each tool manages its own dependencies via `requirements-{toolname}.txt`
+- **Dependency Isolation**: Each tool manages its own dependencies via `requirements/{toolname}.txt`
 - **Self-Contained**: Tools have no dependencies on the core package
 - **Dynamic Tool Types**: Tools can define any custom type without core modifications
 
