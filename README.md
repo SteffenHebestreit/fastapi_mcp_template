@@ -14,7 +14,7 @@ Instead of building MCP servers from scratch, developers can:
 3. Deploy immediately with Docker
 4. Focus on business logic rather than infrastructure
 
-As a demonstration, we've included **file conversion tools** as an example, but this template can be adapted for any MCP use case: data processing, API integrations, content generation, analysis tools, and more.
+As a demonstration, I've included **file conversion tools** as an example, but this template can be adapted for any MCP use case: data processing, API integrations, content generation, analysis tools, and more.
 
 ## 🏗️ Architecture Overview
 
