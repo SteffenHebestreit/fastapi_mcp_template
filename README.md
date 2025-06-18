@@ -1,6 +1,6 @@
 # FastAPI MCP Template
 
-**A flexible, production-ready template for rapid Model Context Protocol (MCP) server development**
+**A flexible, production-ready template for rapid Model Context Protocol (MCP) server prototyping**
 
 This template provides a complete foundation for building custom MCP servers with dynamic tool mounting, dual-interface support (MCP + REST API), and containerized deployment. The main goal is to deliver a **dynamically flexible template for fast MCP development** - allowing developers to quickly create powerful MCP servers by simply adding tools to the `tools/` directory.
 
