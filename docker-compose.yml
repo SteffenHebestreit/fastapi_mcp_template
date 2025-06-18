@@ -1,0 +1,89 @@
+services:
+  filetomarkdown-mcp:
+    build: 
+      context: .
+      args:
+        ENABLED_TOOLS: ${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
+        ENABLE_TESTS: ${ENABLE_TESTS:-false}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount tools directory for hot reloading during development
+      - ./tools:/app/tools:ro
+      # Mount tests directory for hot reloading during development
+      - ./tests:/app/tests:ro
+      # Mount a data directory for file processing
+      - ./data:/app/data:rw
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - RELOAD=true
+      - TOOLS_DIR=/app/tools
+      - DEBUG=true
+      - MARKITDOWN_ENABLE_PLUGINS=true
+      # Control which tools are enabled
+      - ENABLED_TOOLS=${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
+      # Control if tests are enabled
+      - ENABLE_TESTS=${ENABLE_TESTS:-false}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Development service with tests enabled
+  filetomarkdown-mcp-dev:
+    build: 
+      context: .
+      args:
+        ENABLED_TOOLS: ${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
+        ENABLE_TESTS: true
+    ports:
+      - "8001:8000"
+    volumes:
+      # Mount tools directory for hot reloading during development
+      - ./tools:/app/tools:ro
+      # Mount tests directory for hot reloading during development
+      - ./tests:/app/tests:ro
+      # Mount application code for development
+      - ./fastapi_mcp_template:/app/fastapi_mcp_template:ro
+      # Mount a data directory for file processing
+      - ./data:/app/data:rw
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - RELOAD=true
+      - TOOLS_DIR=/app/tools
+      - DEBUG=true
+      - MARKITDOWN_ENABLE_PLUGINS=true
+      # Control which tools are enabled
+      - ENABLED_TOOLS=${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
+      # Enable tests
+      - ENABLE_TESTS=true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    profiles:
+      - dev
+
+  # # Optional: Add a file browser for easier file management
+  # # Default username is 'admin' and password is 'admin'
+  # filebrowser:
+  #   image: filebrowser/filebrowser:latest
+  #   ports:
+  #     - "8081:80"
+  #   volumes:
+  #     - ./data:/srv:rw
+  #   environment:
+  #     - FB_DATABASE=/database.db
+  #   restart: unless-stopped
+
+networks:
+  default:
+    name: filetomarkdown-mcp-network
