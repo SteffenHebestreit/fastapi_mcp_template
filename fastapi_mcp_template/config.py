@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     tools_directory: str = "/app/tools"
     
     # MCP settings
-    mcp_server_name: str = "filetomarkdown-mcp"
+    mcp_server_name: str = "fastapi_mcp_template"
     mcp_server_version: str = "1.0.0"
     
     # OpenAI settings for MarkItDown

@@ -84,7 +84,7 @@ def create_dynamic_routes(app, tool_manager: ToolManager) -> None:
                             }
                         },
                         "serverInfo": {
-                            "name": "fileconverter-mcp",
+                            "name": "fastapi_mcp_template",
                             "version": "1.0.0"
                         },
                         "tools": tool_definitions

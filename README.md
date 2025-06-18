@@ -19,32 +19,39 @@ As a demonstration, we've included **file conversion tools** as an example, but 
 ## 🏗️ Architecture Overview
 
 ```
-fileToMarkdown-mcp/
+fastapi_mcp_template/
 ├── fastapi_mcp_template/          # Core MCP server package
 │   ├── __about__.py              # Version information
 │   ├── __init__.py               # Package initialization
-│   ├── app.py                    # FastAPI application factory
 │   ├── config.py                 # Configuration management
 │   ├── main.py                   # Application entry point
 │   ├── requirements.txt          # Core dependencies only
 │   ├── api/                      # REST API endpoints
 │   │   ├── __init__.py
 │   │   └── routes.py             # API route definitions
-│   ├── converters/               # File conversion logic
+│   ├── core/                     # MCP core functionality
 │   │   ├── __init__.py
-│   │   └── file_to_markdown.py   # Core conversion functionality
-│   └── core/                     # MCP core functionality
+│   │   ├── tool_base.py          # Base tool infrastructure
+│   │   ├── tool_definition.py    # Tool interface definitions
+│   │   └── tool_manager.py       # Dynamic tool loading
+│   └── core_test/                # Core functionality tests
 │       ├── __init__.py
-│       ├── mcp_manager.py        # MCP protocol handling
-│       ├── tool_base.py          # Base tool infrastructure
-│       ├── tool_definition.py    # Tool interface definitions
-│       └── tool_manager.py       # Dynamic tool loading
+│       ├── requirements.txt      # Test dependencies
+│       ├── test_base.py
+│       ├── test_core.py
+│       └── test_manager.py
 ├── tools/                        # Self-contained tools (your custom tools go here!)
 │   ├── file_converter.py         # Example: File-to-Markdown converter
 │   ├── text_processor.py         # Example: Text processing operations
 │   ├── url_fetcher.py            # Example: URL content fetcher
-│   ├── requirements-file_converter.txt  # Tool-specific dependencies
-│   └── requirements-url_fetcher.txt     # Tool-specific dependencies
+│   └── requirements/             # Tool-specific dependencies
+│       ├── file_converter.txt    # Dependencies for file_converter
+│       ├── text_processor.txt    # Dependencies for text_processor
+│       └── url_fetcher.txt       # Dependencies for url_fetcher
+├── tests/                        # Tool tests
+│   ├── __init__.py
+│   └── test_tools.py
+├── data/                         # Data directory for file storage
 ├── docker-compose.yml            # Container orchestration
 ├── Dockerfile                    # Container definition with dynamic deps
 ├── .env.example                  # Environment configuration template
@@ -117,9 +124,9 @@ The server correctly declares its capabilities during initialization:
     "tools": {
       "listChanged": true
     }
-  },
+  },  
   "serverInfo": {
-    "name": "fileconverter-mcp",
+    "name": "fastapi_mcp_template",
     "version": "1.0.0"
   }
 }
@@ -271,7 +278,7 @@ This template can be adapted for any MCP server use case:
 ```bash
 # Clone the template
 git clone https://github.com/SteffenHebestreit/fastapi_mcp_template.git
-cd fileToMarkdown-mcp
+cd fastapi_mcp_template
 
 # Start with default configuration
 docker-compose up --build
@@ -313,14 +320,14 @@ docker-compose down
 ```bash
 # 1. Clone and navigate
 git clone https://github.com/SteffenHebestreit/fastapi_mcp_template.git
-cd fileToMarkdown-mcp
+cd fastapi_mcp_template
 
 # 2. Install core dependencies
 pip install -r fastapi_mcp_template/requirements.txt
 
 # 3. Install tool dependencies (choose what you need)
-pip install -r tools/requirements-file_converter.txt  # For file conversion
-pip install -r tools/requirements-url_fetcher.txt     # For URL fetching
+pip install -r tools/requirements/file_converter.txt  # For file conversion
+pip install -r tools/requirements/url_fetcher.txt     # For URL fetching
 # text_processor has no additional dependencies
 
 # 4. Run the server
@@ -552,9 +559,10 @@ def setup_tool(tool_base):
 If your tool requires additional packages:
 
 ```bash
-# Create tools/requirements-my_custom_tool.txt
-echo "requests>=2.28.0" > tools/requirements-my_custom_tool.txt
-echo "beautifulsoup4>=4.11.0" >> tools/requirements-my_custom_tool.txt
+# Create tools/requirements/my_custom_tool.txt
+mkdir -p tools/requirements
+echo "requests>=2.28.0" > tools/requirements/my_custom_tool.txt
+echo "beautifulsoup4>=4.11.0" >> tools/requirements/my_custom_tool.txt
 ```
 
 ### Step 3: Enable Your Tool
@@ -645,7 +653,7 @@ docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
 
 #### Using MCP Inspector (Recommended)
 
-1. Make sure the fileconverter-mcp server is running:
+1. Make sure the fastapi_mcp_template server is running:
    ```bash
    docker-compose up -d
    ```
@@ -703,7 +711,7 @@ curl -X POST http://localhost:8000/mcp \
 
 #### Debugging
 
-- Check Docker logs: `docker-compose logs fileconverter-mcp`
+- Check Docker logs: `docker-compose logs fastapi_mcp_template`
 - Check if port 8000 is accessible: `curl http://localhost:8000/mcp`
 - Use MCP Inspector's debug features to see the full request/response flow
 
@@ -764,7 +772,7 @@ The project uses a separated testing approach that mirrors the separation betwee
 **Via Docker Compose (Development):**
 ```bash
 # Start development container with tests enabled
-docker-compose --profile dev up filetomarkdown-mcp-dev
+docker-compose --profile dev up fastapi_mcp_template-dev
 
 # List available tests
 curl http://localhost:8000/tests

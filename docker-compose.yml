@@ -1,5 +1,5 @@
 services:
-  filetomarkdown-mcp:
+  fastapi_mcp_template:
     build: 
       context: .
       args:
@@ -34,7 +34,7 @@ services:
       start_period: 40s
 
   # Development service with tests enabled
-  filetomarkdown-mcp-dev:
+  fastapi_mcp_template-dev:
     build: 
       context: .
       args:
@@ -86,4 +86,4 @@ services:
 
 networks:
   default:
-    name: filetomarkdown-mcp-network
+    name: fastapi_mcp_template-network
