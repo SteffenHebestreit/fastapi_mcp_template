@@ -270,7 +270,7 @@ This template can be adapted for any MCP server use case:
 
 ```bash
 # Clone the template
-git clone <repository-url>
+git clone https://github.com/SteffenHebestreit/fastapi_mcp_template.git
 cd fileToMarkdown-mcp
 
 # Start with default configuration
@@ -312,7 +312,7 @@ docker-compose down
 
 ```bash
 # 1. Clone and navigate
-git clone <repository-url>
+git clone https://github.com/SteffenHebestreit/fastapi_mcp_template.git
 cd fileToMarkdown-mcp
 
 # 2. Install core dependencies
