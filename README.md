@@ -767,16 +767,16 @@ The project uses a separated testing approach that mirrors the separation betwee
 docker-compose --profile dev up filetomarkdown-mcp-dev
 
 # List available tests
-curl http://localhost:8001/tests
+curl http://localhost:8000/tests
 
 # Check test status
-curl http://localhost:8001/tests/status
+curl http://localhost:8000/tests/status
 
 # Run all tests via API
-curl -X POST http://localhost:8001/tests/run-all
+curl -X POST http://localhost:8000/tests/run-all
 
 # Run specific test
-curl -X POST http://localhost:8001/tests/run/test_tools
+curl -X POST http://localhost:8000/tests/run/test_tools
 ```
 
 **Via Environment Variable:**
