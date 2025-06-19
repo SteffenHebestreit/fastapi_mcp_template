@@ -1,8 +1,16 @@
 # FastAPI MCP Template
 
-**A flexible, production-ready template for rapid Model Context Protocol (MCP) server prototyping**
+**A production-ready FastAPI MCP server template for rapid MCP development and prototyping**
 
 This template provides a complete foundation for building custom MCP servers with dynamic tool mounting, dual-interface support (MCP + REST API), and containerized deployment. The main goal is to deliver a **dynamically flexible template for fast MCP development** - allowing developers to quickly create powerful MCP servers by simply adding tools to the `tools/` directory.
+
+**Featured Example: Advanced File-to-Markdown Conversion**
+
+This template demonstrates its capabilities with sophisticated file conversion tools that include:
+- **Standard file conversion** using MarkItDown library
+- **LLM-enhanced image processing** for detailed descriptions
+- **OCR fallback for scanned PDFs** using vision-capable LLMs
+- **Support for multiple file formats**: PDF, DOCX, images, and more
 
 ## 🎯 Project Goal
 
@@ -14,12 +22,12 @@ Instead of building MCP servers from scratch, developers can:
 3. Deploy immediately with Docker
 4. Focus on business logic rather than infrastructure
 
-As a demonstration, I've included **file conversion tools** as an example, but this template can be adapted for any MCP use case: data processing, API integrations, content generation, analysis tools, and more.
+As a demonstration, I've included **advanced file conversion tools** as an example, but this template can be adapted for any MCP use case: data processing, API integrations, content generation, analysis tools, and more.
 
 ## 🏗️ Architecture Overview
 
 ```
-fastapi_mcp_template/
+fastapi-mcp-template/
 ├── fastapi_mcp_template/          # Core MCP server package
 │   ├── __about__.py              # Version information
 │   ├── __init__.py               # Package initialization
@@ -41,11 +49,11 @@ fastapi_mcp_template/
 │       ├── test_core.py
 │       └── test_manager.py
 ├── tools/                        # Self-contained tools (your custom tools go here!)
-│   ├── file_converter.py         # Example: File-to-Markdown converter
+│   ├── file_converter.py         # Example: File-to-Markdown converter with OCR
 │   ├── text_processor.py         # Example: Text processing operations
 │   ├── url_fetcher.py            # Example: URL content fetcher
 │   └── requirements/             # Tool-specific dependencies
-│       ├── file_converter.txt    # Dependencies for file_converter
+│       ├── file_converter.txt    # Dependencies for file_converter (markitdown, openai, PyMuPDF)
 │       ├── text_processor.txt    # Dependencies for text_processor
 │       └── url_fetcher.txt       # Dependencies for url_fetcher
 ├── tests/                        # Tool tests
@@ -261,13 +269,14 @@ This comprehensive compliance ensures that any MCP client can seamlessly connect
 
 This template can be adapted for any MCP server use case:
 
-- **📄 Document Processing**: Convert, analyze, or transform documents
+- **📄 Document Processing**: Convert, analyze, or transform documents with LLM-enhanced OCR
 - **🔗 API Integrations**: Connect to external services and APIs  
 - **📊 Data Analysis**: Process and analyze datasets
-- **🎨 Content Generation**: Create or transform content
+- **🎨 Content Generation**: Create or transform content with AI assistance
 - **🔍 Information Retrieval**: Search and fetch information from various sources
 - **🧮 Calculations**: Perform complex calculations or simulations
 - **📈 Monitoring**: Gather metrics or monitor systems
+- **🖼️ Image Analysis**: Extract text and descriptions from images using vision-capable LLMs
 
 ## 📦 Installation & Setup
 
@@ -277,8 +286,8 @@ This template can be adapted for any MCP server use case:
 
 ```bash
 # Clone the template
-git clone https://github.com/SteffenHebestreit/fastapi_mcp_template.git
-cd fastapi_mcp_template
+git clone https://github.com/SteffenHebestreit/fastapi-mcp-template.git
+cd fastapi-mcp-template
 
 # Start with default configuration
 docker-compose up --build
@@ -319,14 +328,14 @@ docker-compose down
 
 ```bash
 # 1. Clone and navigate
-git clone https://github.com/SteffenHebestreit/fastapi_mcp_template.git
-cd fastapi_mcp_template
+git clone https://github.com/SteffenHebestreit/fastapi-mcp-template.git
+cd fastapi-mcp-template
 
 # 2. Install core dependencies
 pip install -r fastapi_mcp_template/requirements.txt
 
 # 3. Install tool dependencies (choose what you need)
-pip install -r tools/requirements/file_converter.txt  # For file conversion
+pip install -r tools/requirements/file_converter.txt  # For file conversion with OCR
 pip install -r tools/requirements/url_fetcher.txt     # For URL fetching
 # text_processor has no additional dependencies
 
@@ -367,7 +376,7 @@ Enable OpenAI integration for enhanced image processing and content analysis:
 
 #### Basic OpenAI Setup
 ```bash
-# Enable LLM features
+# Enable LLM features for enhanced file conversion
 FTMD_MARKITDOWN_ENABLE_LLM=true
 
 # Your OpenAI API key
@@ -414,12 +423,19 @@ Common OpenAI models that work well with MarkItDown:
 - `gpt-4-turbo`
 - `gpt-4`
 
-#### Features Enhanced by OpenAI
-When OpenAI integration is enabled, MarkItDown can:
+#### Features Enhanced by LLM Integration
+When LLM integration is enabled, the file converter provides:
 1. **Enhanced Image Processing**: Generate detailed descriptions of images, charts, and diagrams
-2. **Better OCR**: Improve text extraction from complex images
-3. **Content Analysis**: Better understanding of document structure and content
+2. **OCR for Scanned PDFs**: Automatically converts PDF pages to images and extracts text using vision-capable LLMs
+3. **Better Content Analysis**: Improved understanding of document structure and content
 4. **Smart Formatting**: More intelligent Markdown formatting decisions
+
+**OCR Fallback Process:**
+- When a PDF returns empty content (indicating it's likely scanned)
+- The tool automatically converts PDF pages to high-resolution images
+- Each page is processed by the LLM using vision capabilities
+- Extracted text is combined into properly formatted Markdown
+- Supports up to 5 pages per document to manage API costs
 
 ### Docker Configuration
 
@@ -588,16 +604,20 @@ That's it! Your tool is now available through both MCP and REST API interfaces.
 Once running, the server provides multiple interfaces:
 
 ### MCP Protocol Endpoints
-- `POST /mcp/initialize` - Initialize MCP session
-- `POST /mcp/list_tools` - List available tools  
-- `POST /mcp/call_tool` - Execute a tool
-- `GET /mcp/schema/{tool_name}` - Get tool schema
+- `POST /mcp` - Main MCP protocol endpoint (handles all MCP methods)
+- `GET /mcp/session` - Session creation helper endpoint
 
 ### REST API Endpoints
-- `GET /api/health` - Health check
-- `GET /api/tools` - List available tools
-- `POST /api/tools/{tool_name}/execute` - Execute a tool
-- `GET /api/tools/{tool_name}/schema` - Get tool schema
+- `GET /api/health` - Health check endpoint
+- `GET /api/tools` - List all available tools
+- `POST /api/tools/{tool_name}` - Execute a specific tool
+- `GET /api/tools/{tool_name}/schema` - Get tool parameter schema
+- `GET /docs` - Interactive API documentation
+
+### Available Tools
+- `file_to_markdown` - Convert files to Markdown with OCR fallback
+- `text_processor` - Process and transform text content
+- `url_fetcher` - Fetch and process content from URLs
 
 ### Example Usage
 
@@ -606,28 +626,62 @@ Once running, the server provides multiple interfaces:
 # List available tools
 curl http://localhost:8000/api/tools
 
-# Execute file converter
-curl -X POST http://localhost:8000/api/tools/file_converter/execute \
+# Execute file converter with base64 content
+curl -X POST http://localhost:8000/api/tools/file_to_markdown \
   -H "Content-Type: application/json" \
-  -d '{"filename": "document.pdf", "base64_content": "..."}'
+  -d '{"filename": "document.pdf", "base64_content": "JVBERi0xLjQK..."}'
 
 # Process text
-curl -X POST http://localhost:8000/api/tools/text_processor/execute \
+curl -X POST http://localhost:8000/api/tools/text_processor \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello World", "operation": "uppercase"}'
+
+# Fetch URL content
+curl -X POST http://localhost:8000/api/tools/url_fetcher \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
 ```
 
 **Via MCP Protocol:**
 ```bash
-# Initialize session
-curl -X POST http://localhost:8000/mcp/initialize \
+# Initialize MCP session
+curl -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"protocolVersion": "2024-11-05", "capabilities": {}}'
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2024-11-05",
+      "capabilities": {},
+      "clientInfo": {"name": "test-client", "version": "1.0.0"}
+    }
+  }'
+
+# List tools (after initialization)
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Mcp-Session-Id: <session-id-from-initialize>" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/list",
+    "params": {}
+  }'
 
 # Call tool
-curl -X POST http://localhost:8000/mcp/call_tool \
+curl -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"name": "text_processor", "arguments": {"text": "Hello", "operation": "uppercase"}}'
+  -H "Mcp-Session-Id: <session-id>" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "tools/call",
+    "params": {
+      "name": "file_to_markdown",
+      "arguments": {"filename": "test.pdf", "base64_content": "..."}
+    }
+  }'
 ```
 
 ## 🔍 Monitoring & Health
@@ -653,7 +707,7 @@ docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
 
 #### Using MCP Inspector (Recommended)
 
-1. Make sure the fastapi_mcp_template server is running:
+1. Make sure the fastapi-mcp-template server is running:
    ```bash
    docker-compose up -d
    ```
@@ -711,33 +765,55 @@ curl -X POST http://localhost:8000/mcp \
 
 #### Debugging
 
-- Check Docker logs: `docker-compose logs fastapi_mcp_template`
+- Check Docker logs: `docker-compose logs fastapi-mcp-template`
 - Check if port 8000 is accessible: `curl http://localhost:8000/mcp`
 - Use MCP Inspector's debug features to see the full request/response flow
 
-#### Testing OpenAI Integration
+#### Testing LLM-Enhanced File Conversion
 
-Test the OpenAI integration by uploading an image file through the API:
+Test the advanced file conversion capabilities:
 
+**Convert an image with enhanced descriptions:**
 ```bash
-# Convert an image with enhanced descriptions (when OpenAI is enabled)
 curl -X POST "http://localhost:8000/api/tools/file_to_markdown" \
-  -F "file=@your-image.jpg" \
-  -F "params={}"
+  -H "Content-Type: application/json" \
+  -d '{
+    "filename": "chart.png",
+    "base64_content": "iVBORw0KGgoAAAANSUhEUgAA..."
+  }'
 ```
 
-When OpenAI is enabled, you should see more detailed descriptions in the output.
+**Convert a scanned PDF with OCR fallback:**
+```bash
+curl -X POST "http://localhost:8000/api/tools/file_to_markdown" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filename": "scanned_document.pdf", 
+    "base64_content": "JVBERi0xLjYNJeLjz9MN..."
+  }'
+```
 
-**OpenAI Integration Troubleshooting:**
+**Expected behavior with LLM integration:**
+- Images: Detailed descriptions of visual content
+- Scanned PDFs: Automatic OCR processing when no text is found
+- Regular PDFs: Standard text extraction with enhanced formatting
 
+**LLM Integration Troubleshooting:**
+
+- **PyMuPDF Not Available**: Install with `pip install PyMuPDF>=1.24.0` for OCR functionality
 - **OpenAI Library Not Available**: Install dependencies with `pip install openai>=1.0.0`
 - **API Key Issues**: 
   - Ensure your API key is valid and has sufficient credits
-  - Check that the base URL is correct for Azure OpenAI
+  - Check that the base URL is correct for Azure OpenAI or custom endpoints
   - Verify environment variable names use the `FTMD_` prefix
 - **Model Not Found**: 
   - Ensure the model name is correct for your OpenAI setup
   - For Azure OpenAI, use your deployment name, not the base model name
+  - Verify the model supports vision capabilities for OCR features
+- **OCR Not Triggering**: 
+  - Check that `FTMD_MARKITDOWN_ENABLE_LLM=true` is set
+  - Verify the PDF actually contains no extractable text (scanned documents)
+  - Look for "Attempting OCR fallback" messages in logs
 
 **Security Considerations:**
 - Never commit API keys to version control
@@ -746,9 +822,11 @@ When OpenAI is enabled, you should see more detailed descriptions in the output.
 - Monitor API usage for unexpected activity
 
 **Cost Considerations:**
-- OpenAI integration incurs API costs based on usage
-- Image processing typically uses more tokens than text
+- LLM integration incurs API costs based on usage
+- OCR processing (scanned PDFs) uses more tokens than standard text extraction
+- Image processing typically uses more tokens than text-only operations
 - Consider using `gpt-4o-mini` for cost-effective processing
+- OCR processing is limited to 5 pages per PDF to manage costs
 - Monitor your usage through the OpenAI dashboard
 
 ### Testing Structure
@@ -772,7 +850,7 @@ The project uses a separated testing approach that mirrors the separation betwee
 **Via Docker Compose (Development):**
 ```bash
 # Start development container with tests enabled
-docker-compose --profile dev up fastapi_mcp_template-dev
+docker-compose --profile dev up fastapi-mcp-template-dev
 
 # List available tests
 curl http://localhost:8000/tests
@@ -855,6 +933,10 @@ Ready to build your MCP server?
 
 1. **Fork this template**
 2. **Clone your fork**
+   ```bash
+   git clone https://github.com/yourusername/fastapi-mcp-template.git
+   cd fastapi-mcp-template
+   ```
 3. **Add your custom tools** to the `tools/` directory
 4. **Configure** via `.env` file
 5. **Deploy** with `docker-compose up --build`

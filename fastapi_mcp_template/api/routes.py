@@ -58,21 +58,10 @@ def create_dynamic_routes(app, tool_manager: ToolManager) -> None:
                 # Create new session and mark as initialized immediately
                 active_sessions[session_id]["initialized"] = True  # Mark as initialized right away for compatibility
                 logger.info(f"Session {session_id} marked as initialized")
+                  # Get available tools from tool manager for reference (not returned in initialize)
+                tool_count = len(tool_manager.registered_tools)
                 
-                # Get available tools from tool manager
-                tool_definitions = []
-                for tool_name, tool_info in tool_manager.registered_tools.items():
-                    tool_definition = tool_info["definition"]
-                    tool_instance = tool_info["instance"]
-                    schema = tool_instance.get_schema()
-                    
-                    tool_definitions.append({
-                        "name": tool_definition.name,
-                        "description": tool_definition.description,
-                        "inputSchema": schema.to_dict() if hasattr(schema, 'to_dict') else schema
-                    })
-                
-                # Response with proper tool capabilities declaration and available tools
+                # Response with proper capabilities declaration (tools are fetched separately)
                 response_data = {
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -86,10 +75,11 @@ def create_dynamic_routes(app, tool_manager: ToolManager) -> None:
                         "serverInfo": {
                             "name": "fastapi_mcp_template",
                             "version": "1.0.0"
-                        },
-                        "tools": tool_definitions
+                        }
                     }
                 }
+                
+                logger.info(f"Initialize response: {tool_count} tools available")
                 
                 return JSONResponse(
                     content=response_data,
@@ -147,30 +137,47 @@ def create_dynamic_routes(app, tool_manager: ToolManager) -> None:
                     "id": request_id,
                     "result": {
                         "tools": tool_definitions
-                    }
-                }
+                    }                }
             
             elif method == "tools/call":
                 tool_name = params.get("name")
                 arguments = params.get("arguments", {})
                 
-                result = await tool_manager.execute_tool(tool_name, **arguments)
-                
-                # Format result as MCP content
-                result_text = str(result) if not isinstance(result, str) else result
-                
-                response_data = {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": result_text
-                            }
-                        ]
+                try:
+                    result = await tool_manager.execute_tool(tool_name, **arguments)
+                    
+                    # Format result as MCP content
+                    result_text = str(result) if not isinstance(result, str) else result
+                    
+                    response_data = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": result_text
+                                }
+                            ]
+                        }
                     }
-                }
+                    
+                except Exception as e:
+                    # Tool execution errors should be returned as successful JSON-RPC responses
+                    # with isError flag, not as JSON-RPC errors (per MCP spec)
+                    response_data = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"Tool execution failed: {str(e)}"
+                                }
+                            ],
+                            "isError": True
+                        }
+                    }
                 
             elif method == "ping":
                 response_data = {

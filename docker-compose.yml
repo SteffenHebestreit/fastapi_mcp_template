@@ -1,5 +1,5 @@
 services:
-  fastapi_mcp_template:
+  fastapi-mcp-template:
     build: 
       context: .
       args:
@@ -25,6 +25,11 @@ services:
       - ENABLED_TOOLS=${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
       # Control if tests are enabled
       - ENABLE_TESTS=${ENABLE_TESTS:-false}
+      # OpenAI settings for MarkItDown
+      - FTMD_MARKITDOWN_ENABLE_LLM=${FTMD_MARKITDOWN_ENABLE_LLM:-false}
+      - FTMD_OPENAI_API_KEY=${FTMD_OPENAI_API_KEY}
+      - FTMD_OPENAI_MODEL=${FTMD_OPENAI_MODEL:-gpt-4o}
+      - FTMD_OPENAI_BASE_URL=${FTMD_OPENAI_BASE_URL}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -32,9 +37,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-
   # Development service with tests enabled
-  fastapi_mcp_template-dev:
+  fastapi-mcp-template-dev:
     build: 
       context: .
       args:
@@ -48,8 +52,7 @@ services:
       # Mount tests directory for hot reloading during development
       - ./tests:/app/tests:ro
       # Mount application code for development
-      - ./fastapi_mcp_template:/app/fastapi_mcp_template:ro
-      # Mount a data directory for file processing
+      - ./fastapi_mcp_template:/app/fastapi_mcp_template:ro      # Mount a data directory for file processing
       - ./data:/app/data:rw
     environment:
       - HOST=0.0.0.0
@@ -62,6 +65,11 @@ services:
       - ENABLED_TOOLS=${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
       # Enable tests
       - ENABLE_TESTS=true
+      # OpenAI settings for MarkItDown
+      - FTMD_MARKITDOWN_ENABLE_LLM=${FTMD_MARKITDOWN_ENABLE_LLM:-false}
+      - FTMD_OPENAI_API_KEY=${FTMD_OPENAI_API_KEY}
+      - FTMD_OPENAI_MODEL=${FTMD_OPENAI_MODEL:-gpt-4o}
+      - FTMD_OPENAI_BASE_URL=${FTMD_OPENAI_BASE_URL}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
