@@ -144,7 +144,7 @@ Tools follow MCP tool specification with proper JSON Schema validation:
 
 ```json
 {
-  "name": "file_converter",
+  "name": "file_to_markdown",
   "description": "Convert files to Markdown format",
   "inputSchema": {
     "type": "object",
