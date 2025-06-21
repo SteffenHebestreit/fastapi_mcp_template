@@ -22,6 +22,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libmagic1 \
     curl \
     bash \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-fra \
+    tesseract-ocr-deu \
+    tesseract-ocr-spa \
+    libtesseract-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set work directory
