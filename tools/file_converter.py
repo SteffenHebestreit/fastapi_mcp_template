@@ -105,7 +105,8 @@ class FileToMarkdownConverter(ToolInterface):
                         client_kwargs['base_url'] = openai_base_url
                     
                     client = OpenAI(**client_kwargs)
-                      # Initialize MarkItDown with LLM support
+                    
+                    # Initialize MarkItDown with LLM support
                     try:
                         self.markitdown = MarkItDown(
                             llm_client=client,
@@ -169,9 +170,14 @@ class FileToMarkdownConverter(ToolInterface):
             self.markitdown = MarkItDown(enable_plugins=False)
             if self.tool_base and hasattr(self.tool_base, 'log_error'):
                 self.tool_base.log_error(f"Error initializing MarkItDown: {e}")
-    
-    async def _ocr_pdf_with_llm(self, pdf_content: bytes, llm_client) -> str:
-        """Convert PDF pages to images and use LLM for OCR."""
+
+    async def _ocr_pdf_with_fallback(self, pdf_content: bytes, llm_client) -> str:
+        """
+        Enhanced PDF OCR with three-level fallback:
+        1. Traditional OCR (pytesseract/easyocr) - fast and cost-effective
+        2. LLM vision analysis - for complex layouts and handwriting
+        3. Combination approach - if needed
+        """
         try:
             # Try to import required libraries for PDF to image conversion
             try:
@@ -180,13 +186,13 @@ class FileToMarkdownConverter(ToolInterface):
                 self.tool_base.log_error("PyMuPDF not available - cannot convert PDF to images for OCR")
                 return ""
             
-            self.tool_base.log_info("Converting PDF pages to images for OCR...")
+            self.tool_base.log_info("Converting PDF pages to images for enhanced OCR...")
             
             # Open PDF with PyMuPDF
             pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
             extracted_text = []
             
-            # Process first few pages (limit to avoid excessive API calls)
+            # Process first few pages (limit to avoid excessive processing)
             max_pages = min(5, pdf_doc.page_count)
             self.tool_base.log_info(f"Processing {max_pages} pages out of {pdf_doc.page_count} total pages")
             
@@ -198,59 +204,151 @@ class FileToMarkdownConverter(ToolInterface):
                 pix = page.get_pixmap(matrix=mat)
                 img_data = pix.tobytes("png")
                 
-                # Convert to base64 for LLM
-                import base64
-                img_base64 = base64.b64encode(img_data).decode()
+                self.tool_base.log_info(f"Processing page {page_num + 1}...")
                 
-                self.tool_base.log_info(f"Processing page {page_num + 1} with LLM...")
+                # Level 1: Try traditional OCR first (fast and free)
+                ocr_text = await self._extract_text_with_ocr(img_data, page_num + 1)
                 
-                # Use LLM to extract text from image
-                try:
-                    response = llm_client.chat.completions.create(
-                        model=getattr(self.markitdown, '_llm_model', 'gpt-4o'),
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Please extract all text from this image. Return only the text content, maintaining the original structure and formatting as much as possible. If there are multiple columns, preserve the reading order."
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/png;base64,{img_base64}"
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        max_tokens=4000
-                    )
-                    
-                    page_text = response.choices[0].message.content
-                    if page_text and page_text.strip():
-                        extracted_text.append(f"# Page {page_num + 1}\n\n{page_text.strip()}\n\n")
-                        self.tool_base.log_info(f"Extracted {len(page_text)} characters from page {page_num + 1}")
-                    else:
-                        self.tool_base.log_info(f"No text extracted from page {page_num + 1}")
-                        
-                except Exception as e:
-                    self.tool_base.log_error(f"LLM OCR failed for page {page_num + 1}: {e}")
+                if ocr_text and len(ocr_text.strip()) > 50:  # Good OCR result
+                    extracted_text.append(f"# Page {page_num + 1}\n\n{ocr_text.strip()}\n\n")
+                    self.tool_base.log_info(f"Successfully extracted {len(ocr_text)} characters from page {page_num + 1} using OCR")
                     continue
+                
+                # Level 2: Fall back to LLM vision analysis
+                self.tool_base.log_info(f"OCR yield insufficient, trying LLM vision analysis for page {page_num + 1}")
+                llm_text = await self._extract_text_with_llm(img_data, llm_client, page_num + 1)
+                
+                if llm_text and llm_text.strip():
+                    extracted_text.append(f"# Page {page_num + 1}\n\n{llm_text.strip()}\n\n")
+                    self.tool_base.log_info(f"Extracted {len(llm_text)} characters from page {page_num + 1} using LLM")
+                else:
+                    # Level 3: Combination approach (if both methods found something)
+                    if ocr_text and ocr_text.strip():
+                        combined_text = await self._combine_ocr_and_llm(ocr_text, llm_text, page_num + 1)
+                        extracted_text.append(f"# Page {page_num + 1}\n\n{combined_text}\n\n")
+                    else:
+                        self.tool_base.log_warning(f"No text could be extracted from page {page_num + 1}")
             
             pdf_doc.close()
             
             # Combine all extracted text
             full_text = "\n".join(extracted_text)
-            self.tool_base.log_info(f"OCR completed. Total extracted text length: {len(full_text)}")
+            self.tool_base.log_info(f"Enhanced OCR completed. Total extracted text length: {len(full_text)}")
             
             return full_text
             
         except Exception as e:
-            self.tool_base.log_error(f"PDF OCR conversion failed: {e}")
+            self.tool_base.log_error(f"Enhanced OCR failed: {e}")
             return ""
     
+    async def _extract_text_with_ocr(self, img_data: bytes, page_num: int) -> str:
+        """Extract text using traditional OCR (pytesseract or easyocr)."""
+        try:
+            # Try pytesseract first (most common)
+            try:
+                import pytesseract
+                from PIL import Image
+                import io
+                
+                # Convert image data to PIL Image
+                image = Image.open(io.BytesIO(img_data))
+                
+                # Extract text with pytesseract
+                text = pytesseract.image_to_string(image, config='--psm 6')
+                self.tool_base.log_info(f"Pytesseract extracted {len(text)} characters from page {page_num}")
+                return text
+                
+            except ImportError:
+                self.tool_base.log_info("Pytesseract not available, trying easyocr...")
+                
+                # Try easyocr as fallback
+                try:
+                    import easyocr
+                    import numpy as np
+                    from PIL import Image
+                    import io
+                    
+                    # Convert image to numpy array
+                    image = Image.open(io.BytesIO(img_data))
+                    img_array = np.array(image)
+                    
+                    # Initialize EasyOCR reader (English by default)
+                    reader = easyocr.Reader(['en'])
+                    
+                    # Extract text
+                    results = reader.readtext(img_array)
+                    
+                    # Combine all detected text
+                    text = '\n'.join([result[1] for result in results])
+                    self.tool_base.log_info(f"EasyOCR extracted {len(text)} characters from page {page_num}")
+                    return text
+                    
+                except ImportError:
+                    self.tool_base.log_warning("Neither pytesseract nor easyocr available for traditional OCR")
+                    return ""
+                    
+        except Exception as e:
+            self.tool_base.log_error(f"Traditional OCR failed for page {page_num}: {e}")
+            return ""
+    
+    async def _extract_text_with_llm(self, img_data: bytes, llm_client, page_num: int) -> str:
+        """Extract text using LLM vision analysis."""
+        try:
+            # Convert to base64 for LLM
+            import base64
+            img_base64 = base64.b64encode(img_data).decode()
+            
+            # Use LLM to extract text from image
+            response = llm_client.chat.completions.create(
+                model=getattr(self.markitdown, '_llm_model', 'gpt-4o'),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Please extract all text from this image. Return only the text content, maintaining the original structure and formatting as much as possible. If there are multiple columns, preserve the reading order."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=4000
+            )
+            
+            text = response.choices[0].message.content
+            return text if text else ""
+            
+        except Exception as e:
+            self.tool_base.log_error(f"LLM vision analysis failed for page {page_num}: {e}")
+            return ""
+    
+    async def _combine_ocr_and_llm(self, ocr_text: str, llm_text: str, page_num: int) -> str:
+        """Combine OCR and LLM results for better accuracy."""
+        try:
+            # If we have both results, prefer the longer/more complete one
+            if not llm_text or not llm_text.strip():
+                return ocr_text
+            
+            if not ocr_text or not ocr_text.strip():
+                return llm_text
+              # If both exist, use the one with more content
+            if len(llm_text.strip()) > len(ocr_text.strip()) * 1.5:
+                self.tool_base.log_info(f"Using LLM result for page {page_num} (more comprehensive)")
+                return llm_text
+            else:
+                self.tool_base.log_info(f"Using OCR result for page {page_num} (sufficient quality)")
+                return ocr_text
+                
+        except Exception as e:
+            self.tool_base.log_error(f"Failed to combine OCR and LLM results for page {page_num}: {e}")
+            return ocr_text or llm_text or ""
+
     def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="file_to_markdown",
@@ -482,7 +580,7 @@ class FileToMarkdownConverter(ToolInterface):
                             # Try to implement OCR fallback for scanned PDFs
                             try:
                                 self.tool_base.log_info("Attempting OCR fallback for scanned PDF...")
-                                ocr_result = await self._ocr_pdf_with_llm(file_content, llm_client)
+                                ocr_result = await self._ocr_pdf_with_fallback(file_content, llm_client)
                                 if ocr_result and ocr_result.strip():
                                     self.tool_base.log_info(f"OCR successful! Extracted {len(ocr_result)} characters")
                                     # Override the empty result with OCR content

@@ -9,7 +9,8 @@ This template provides a complete foundation for building custom MCP servers wit
 This template demonstrates its capabilities with sophisticated file conversion tools that include:
 - **Standard file conversion** using MarkItDown library
 - **LLM-enhanced image processing** for detailed descriptions
-- **OCR fallback for scanned PDFs** using vision-capable LLMs
+- **Multi-level OCR fallback** with traditional OCR → LLM vision analysis
+- **Smart processing optimization** balancing cost and accuracy
 - **Support for multiple file formats**: PDF, DOCX, images, and more
 
 ## 🎯 Project Goal
@@ -335,11 +336,17 @@ cd fastapi-mcp-template
 pip install -r fastapi_mcp_template/requirements.txt
 
 # 3. Install tool dependencies (choose what you need)
-pip install -r tools/requirements/file_converter.txt  # For file conversion with OCR
+pip install -r tools/requirements/file_converter.txt  # For file conversion with enhanced OCR
 pip install -r tools/requirements/url_fetcher.txt     # For URL fetching
 # text_processor has no additional dependencies
 
-# 4. Run the server
+# 4. Additional OCR setup (for traditional OCR fallback)
+# For pytesseract: Install Tesseract OCR engine
+# - Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
+# - Ubuntu/Debian: sudo apt install tesseract-ocr
+# - macOS: brew install tesseract
+
+# 5. Run the server
 python fastapi_mcp_template/main.py
 
 # Or with custom configuration
@@ -430,12 +437,29 @@ When LLM integration is enabled, the file converter provides:
 3. **Better Content Analysis**: Improved understanding of document structure and content
 4. **Smart Formatting**: More intelligent Markdown formatting decisions
 
-**OCR Fallback Process:**
-- When a PDF returns empty content (indicating it's likely scanned)
-- The tool automatically converts PDF pages to high-resolution images
-- Each page is processed by the LLM using vision capabilities
-- Extracted text is combined into properly formatted Markdown
-- Supports up to 5 pages per document to manage API costs
+**Enhanced OCR Fallback Process:**
+The file converter now uses a sophisticated three-level fallback system for scanned PDFs:
+
+1. **Traditional OCR (Primary)**: Fast and cost-effective text extraction using pytesseract or easyocr
+   - Processes document images using traditional OCR algorithms
+   - Ideal for clear, standard fonts and simple layouts
+   - No API costs, works offline
+
+2. **LLM Vision Analysis (Secondary)**: Advanced analysis for complex content
+   - Used when traditional OCR yields insufficient results (<50 characters)
+   - Handles handwriting, complex layouts, and poor-quality scans
+   - Uses vision-capable LLMs for superior accuracy
+
+3. **Intelligent Selection (Tertiary)**: Combines best results
+   - Automatically selects the most comprehensive output
+   - Prefers traditional OCR when sufficient, LLM when needed
+   - Optimizes for both cost and accuracy
+
+**Process Details:**
+- Automatically detects scanned PDFs (empty text content)
+- Converts PDF pages to high-resolution images (2x zoom)
+- Processes up to 5 pages per document to manage costs
+- Maintains original formatting and structure in Markdown output
 
 ### Docker Configuration
 
@@ -810,10 +834,18 @@ curl -X POST "http://localhost:8000/api/tools/file_to_markdown" \
   - Ensure the model name is correct for your OpenAI setup
   - For Azure OpenAI, use your deployment name, not the base model name
   - Verify the model supports vision capabilities for OCR features
-- **OCR Not Triggering**: 
+- **OCR Not Working**: 
   - Check that `FTMD_MARKITDOWN_ENABLE_LLM=true` is set
   - Verify the PDF actually contains no extractable text (scanned documents)
-  - Look for "Attempting OCR fallback" messages in logs
+  - Look for "Attempting enhanced OCR fallback" messages in logs
+- **Traditional OCR Issues**:
+  - **Pytesseract**: Ensure Tesseract OCR engine is installed on system
+  - **EasyOCR**: May require additional GPU setup for optimal performance
+  - **Low Quality Results**: Tool will automatically fall back to LLM vision analysis
+- **OCR Performance**:
+  - Traditional OCR is preferred for cost efficiency (no API costs)
+  - LLM vision analysis activates when OCR yields <50 characters
+  - Processing limited to 5 pages per PDF to manage costs
 
 **Security Considerations:**
 - Never commit API keys to version control
