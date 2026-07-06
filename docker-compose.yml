@@ -1,35 +1,33 @@
 services:
-  fastapi-mcp-template:
-    build: 
+  # Production service: no source bind-mounts, no reload, tests disabled.
+  file-extraction-service:
+    build:
       context: .
       args:
         ENABLED_TOOLS: ${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
-        ENABLE_TESTS: ${ENABLE_TESTS:-false}
+        ENABLE_TESTS: "false"
     ports:
       - "8000:8000"
     volumes:
-      # Mount tools directory for hot reloading during development
-      - ./tools:/app/tools:ro
-      # Mount tests directory for hot reloading during development
-      - ./tests:/app/tests:ro
-      # Mount a data directory for file processing
+      # Persistent working area for uploaded/processed files.
       - ./data:/app/data:rw
     environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      - RELOAD=true
-      - TOOLS_DIR=/app/tools
-      - DEBUG=true
-      - MARKITDOWN_ENABLE_PLUGINS=true
-      # Control which tools are enabled
-      - ENABLED_TOOLS=${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
-      # Control if tests are enabled
-      - ENABLE_TESTS=${ENABLE_TESTS:-false}
-      # OpenAI settings for MarkItDown
-      - FTMD_MARKITDOWN_ENABLE_LLM=${FTMD_MARKITDOWN_ENABLE_LLM:-false}
-      - FTMD_OPENAI_API_KEY=${FTMD_OPENAI_API_KEY}
-      - FTMD_OPENAI_MODEL=${FTMD_OPENAI_MODEL:-gpt-4o}
-      - FTMD_OPENAI_BASE_URL=${FTMD_OPENAI_BASE_URL}
+      # Runtime settings are read with the FTMD_ prefix (see fastapi_mcp_template/config.py).
+      FTMD_HOST: 0.0.0.0
+      FTMD_PORT: "8000"
+      FTMD_DEBUG: "false"
+      FTMD_RELOAD: "false"
+      FTMD_LOG_LEVEL: INFO
+      # Runtime tool allow-list (empty = load every tool in the image).
+      FTMD_ENABLED_TOOLS: ${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
+      # Security: set an API key to require X-API-Key on tool/admin endpoints.
+      FTMD_API_KEY: ${FTMD_API_KEY:-}
+      FTMD_CORS_ORIGINS: ${FTMD_CORS_ORIGINS:-*}
+      # Optional LLM vision OCR for scanned docs (traditional OCR works without this).
+      FTMD_MARKITDOWN_ENABLE_LLM: ${FTMD_MARKITDOWN_ENABLE_LLM:-false}
+      FTMD_OPENAI_API_KEY: ${FTMD_OPENAI_API_KEY:-}
+      FTMD_OPENAI_MODEL: ${FTMD_OPENAI_MODEL:-gpt-4o}
+      FTMD_OPENAI_BASE_URL: ${FTMD_OPENAI_BASE_URL:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -37,39 +35,33 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-  # Development service with tests enabled
-  fastapi-mcp-template-dev:
-    build: 
+
+  # Development service: hot-reload of tools/tests/source, tests enabled, debug on.
+  file-extraction-service-dev:
+    build:
       context: .
       args:
         ENABLED_TOOLS: ${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
-        ENABLE_TESTS: true
+        ENABLE_TESTS: "true"
     ports:
       - "8001:8000"
     volumes:
-      # Mount tools directory for hot reloading during development
       - ./tools:/app/tools:ro
-      # Mount tests directory for hot reloading during development
       - ./tests:/app/tests:ro
-      # Mount application code for development
-      - ./fastapi_mcp_template:/app/fastapi_mcp_template:ro      # Mount a data directory for file processing
+      - ./fastapi_mcp_template:/app/fastapi_mcp_template:ro
       - ./data:/app/data:rw
     environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      - RELOAD=true
-      - TOOLS_DIR=/app/tools
-      - DEBUG=true
-      - MARKITDOWN_ENABLE_PLUGINS=true
-      # Control which tools are enabled
-      - ENABLED_TOOLS=${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
-      # Enable tests
-      - ENABLE_TESTS=true
-      # OpenAI settings for MarkItDown
-      - FTMD_MARKITDOWN_ENABLE_LLM=${FTMD_MARKITDOWN_ENABLE_LLM:-false}
-      - FTMD_OPENAI_API_KEY=${FTMD_OPENAI_API_KEY}
-      - FTMD_OPENAI_MODEL=${FTMD_OPENAI_MODEL:-gpt-4o}
-      - FTMD_OPENAI_BASE_URL=${FTMD_OPENAI_BASE_URL}
+      FTMD_HOST: 0.0.0.0
+      FTMD_PORT: "8000"
+      FTMD_DEBUG: "true"
+      FTMD_RELOAD: "true"
+      FTMD_LOG_LEVEL: DEBUG
+      FTMD_ENABLED_TOOLS: ${ENABLED_TOOLS:-file_converter,url_fetcher,text_processor}
+      FTMD_API_KEY: ${FTMD_API_KEY:-}
+      FTMD_MARKITDOWN_ENABLE_LLM: ${FTMD_MARKITDOWN_ENABLE_LLM:-false}
+      FTMD_OPENAI_API_KEY: ${FTMD_OPENAI_API_KEY:-}
+      FTMD_OPENAI_MODEL: ${FTMD_OPENAI_MODEL:-gpt-4o}
+      FTMD_OPENAI_BASE_URL: ${FTMD_OPENAI_BASE_URL:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -80,18 +72,6 @@ services:
     profiles:
       - dev
 
-  # # Optional: Add a file browser for easier file management
-  # # Default username is 'admin' and password is 'admin'
-  # filebrowser:
-  #   image: filebrowser/filebrowser:latest
-  #   ports:
-  #     - "8081:80"
-  #   volumes:
-  #     - ./data:/srv:rw
-  #   environment:
-  #     - FB_DATABASE=/database.db
-  #   restart: unless-stopped
-
 networks:
   default:
-    name: fastapi_mcp_template-network
+    name: file-extraction-service-network

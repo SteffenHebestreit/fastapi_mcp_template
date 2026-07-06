@@ -7,6 +7,7 @@ It's completely self-contained with no imports from the core service.
 
 from typing import Dict, Any
 import re
+import html
 
 class ToolDefinition:
     """Definition structure for a tool."""
@@ -99,9 +100,15 @@ class TextProcessor(ToolInterface):
             elif operation == "lowercase":
                 result = text.lower()
             elif operation == "remove_html":
-                result = re.sub(r'<[^>]+>', '', text)
+                # Drop <script>/<style> bodies entirely, then strip remaining tags
+                # and decode HTML entities so the output is clean readable text.
+                without_blocks = re.sub(
+                    r'<(script|style)\b[^>]*>.*?</\1>', ' ', text, flags=re.IGNORECASE | re.DOTALL
+                )
+                stripped = re.sub(r'<[^>]+>', '', without_blocks)
+                result = re.sub(r'\s+', ' ', html.unescape(stripped)).strip()
             elif operation == "extract_emails":
-                emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+                emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', text)
                 result = "\n".join(emails)
             else:
                 return {

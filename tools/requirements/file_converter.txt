@@ -1,6 +1,13 @@
-markitdown[all]>=0.1.0
-openai>=1.0.0
-PyMuPDF>=1.24.0
-pytesseract>=0.3.10
-easyocr>=1.7.0
-Pillow>=9.0.0
+# Core conversion
+markitdown[all]>=0.1.0,<0.2.0
+# Remote-URL ingestion (SSRF-guarded fetch)
+aiohttp>=3.9.0,<4.0.0
+# LLM vision OCR (optional; only used when FTMD_MARKITDOWN_ENABLE_LLM=true)
+openai>=1.0.0,<2.0.0
+# Scanned-PDF rasterization + traditional OCR
+PyMuPDF>=1.24.0,<2.0.0
+pytesseract>=0.3.10,<0.4.0
+Pillow>=9.0.0,<12.0.0
+# easyocr is a heavy (PyTorch) fallback used only if pytesseract is unavailable.
+# Uncomment to enable; it adds multiple GB to the image.
+# easyocr>=1.7.0,<2.0.0

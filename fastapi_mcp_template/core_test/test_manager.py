@@ -10,7 +10,9 @@ from pathlib import Path
 
 class TestManager:
     """Manages dynamic test loading and execution."""
-    
+
+    __test__ = False  # infrastructure class, not a pytest test case
+
     def __init__(self, tests_directory: str = "/app/tests"):
         self.tests_directory = Path(tests_directory)
         self.registered_tests: Dict[str, Dict[str, Any]] = {}

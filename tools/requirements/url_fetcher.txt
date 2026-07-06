@@ -1,1 +1,3 @@
-aiohttp>=3.9.0
+aiohttp>=3.9.0,<4.0.0
+# Used to convert fetched HTML into LLM-ready Markdown.
+markitdown[all]>=0.1.0,<0.2.0

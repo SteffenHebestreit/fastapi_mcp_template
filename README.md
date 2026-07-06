@@ -1,29 +1,35 @@
-# FastAPI MCP Template
+# File Extraction Service
 
-**A production-ready FastAPI MCP server template for rapid MCP development and prototyping**
+**Extract text and data from files (PDF, Office docs, images, URLs) as LLM-ready context — over both a REST API and the Model Context Protocol (MCP).**
 
-This template provides a complete foundation for building custom MCP servers with dynamic tool mounting, dual-interface support (MCP + REST API), and containerized deployment. The main goal is to deliver a **dynamically flexible template for fast MCP development** - allowing developers to quickly create powerful MCP servers by simply adding tools to the `tools/` directory.
+This service turns documents into clean Markdown you can feed into LLM pipelines
+(RAG, chat-with-your-docs, agent context). It handles the messy ingestion layer so
+you don't have to: format detection, OCR for scanned pages, structured output with
+per-page metadata and token counts, chunking, caching, and SSRF-guarded URL fetching.
 
-**Featured Example: Advanced File-to-Markdown Conversion**
+It is built on a small dynamic-tool framework (drop a `.py` file in `tools/` and it's
+exposed over both interfaces), so you can extend it with your own extractors.
 
-This template demonstrates its capabilities with sophisticated file conversion tools that include:
-- **Standard file conversion** using MarkItDown library
-- **LLM-enhanced image processing** for detailed descriptions
-- **Multi-level OCR fallback** with traditional OCR → LLM vision analysis
-- **Smart processing optimization** balancing cost and accuracy
-- **Support for multiple file formats**: PDF, DOCX, images, and more
+### What it does
+
+- **File → Markdown** via the [MarkItDown](https://github.com/microsoft/markitdown) library: PDF, DOCX, XLSX, PPTX, HTML, images, and more.
+- **OCR fallback for scanned PDFs and images** — traditional OCR (Tesseract) runs first and needs **no API key**; an optional LLM vision model is a second-level fallback for hard pages.
+- **LLM-ready structured output** — Markdown plus per-page text, a token estimate, an extraction-method label, and optional character-based chunks with overlap.
+- **URL ingestion** — fetch a web page as Markdown, or fetch a remote document and extract it, with protection against requests to internal/private addresses (SSRF).
+- **Caching** — identical files are extracted once and served from a content-hash cache (no repeated OCR / vision cost).
+- **Dual interface** — the same tools are available as REST endpoints and as MCP tools for LLM clients.
 
 ## 🎯 Project Goal
 
-**Enable rapid MCP server development through a flexible, self-contained template architecture.**
+**Provide a reliable ingestion boundary between untrusted documents and downstream LLM context.**
 
-Instead of building MCP servers from scratch, developers can:
-1. Clone this template
-2. Add their custom tools to the `tools/` directory  
-3. Deploy immediately with Docker
-4. Focus on business logic rather than infrastructure
+The service is organized as a set of self-contained tools under `tools/`:
 
-As a demonstration, I've included **advanced file conversion tools** as an example, but this template can be adapted for any MCP use case: data processing, API integrations, content generation, analysis tools, and more.
+- `file_converter` — the core file/URL → Markdown extractor (with OCR).
+- `url_fetcher` — fetch a web page/file as Markdown, SSRF-guarded.
+- `text_processor` — small text utilities (clean, case, strip HTML, extract emails).
+
+Add your own extractor by dropping a `tools/your_tool.py` (see “Adding Your Own Tools”); it is discovered automatically and exposed on both interfaces.
 
 ## 🏗️ Architecture Overview
 
@@ -332,25 +338,30 @@ docker-compose down
 git clone https://github.com/SteffenHebestreit/fastapi-mcp-template.git
 cd fastapi-mcp-template
 
-# 2. Install core dependencies
+# 2. (recommended) create a virtualenv
+python -m venv .venv && . .venv/Scripts/activate   # Windows
+# python -m venv .venv && source .venv/bin/activate  # macOS/Linux
+
+# 3. Install core dependencies
 pip install -r fastapi_mcp_template/requirements.txt
 
-# 3. Install tool dependencies (choose what you need)
-pip install -r tools/requirements/file_converter.txt  # For file conversion with enhanced OCR
-pip install -r tools/requirements/url_fetcher.txt     # For URL fetching
+# 4. Install tool dependencies (choose what you need)
+pip install -r tools/requirements/file_converter.txt  # File conversion + OCR
+pip install -r tools/requirements/url_fetcher.txt     # URL fetching
 # text_processor has no additional dependencies
 
-# 4. Additional OCR setup (for traditional OCR fallback)
-# For pytesseract: Install Tesseract OCR engine
-# - Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
+# 5. Additional OCR setup (for the traditional OCR fallback)
+# Install the Tesseract OCR engine:
+# - Windows: https://github.com/UB-Mannheim/tesseract/wiki
 # - Ubuntu/Debian: sudo apt install tesseract-ocr
 # - macOS: brew install tesseract
 
-# 5. Run the server
-python fastapi_mcp_template/main.py
+# 6. Run the server (config comes from FTMD_* env vars / .env — no CLI flags)
+#    PYTHONPATH must include the repo root so the package is importable.
+PYTHONPATH=. python -m fastapi_mcp_template.main
 
-# Or with custom configuration
-python fastapi_mcp_template/main.py --host 0.0.0.0 --port 8000
+# Custom configuration is via environment variables, e.g.:
+FTMD_PORT=8080 FTMD_DEBUG=true PYTHONPATH=. python -m fastapi_mcp_template.main
 ```
 
 ## 🔧 Configuration
@@ -359,22 +370,32 @@ python fastapi_mcp_template/main.py --host 0.0.0.0 --port 8000
 
 Configure the server behavior through environment variables:
 
+All runtime settings use the **`FTMD_`** prefix (see `.env.example` for the full
+list). A stray unprefixed `PORT=...` is ignored — use `FTMD_PORT`.
+
 ```bash
-# Core Configuration
-HOST=0.0.0.0                    # Server host
-PORT=8000                       # Server port
-DEBUG=false                     # Debug mode
-LOG_LEVEL=INFO                  # Logging level
+# Core
+FTMD_HOST=0.0.0.0               # Server host
+FTMD_PORT=8000                  # Server port
+FTMD_DEBUG=false                # Debug mode (also exposes /tests/* endpoints)
+FTMD_RELOAD=false               # uvicorn auto-reload (dev only)
+FTMD_LOG_LEVEL=INFO             # Logging level
 
-# Tool Configuration  
-ENABLED_TOOLS=file_converter,text_processor,url_fetcher  # Comma-separated list
-TOOLS_DIR=/app/tools            # Tools directory path
-MAX_FILE_SIZE=10485760          # Max file size (10MB)
+# Tool loading
+FTMD_ENABLED_TOOLS=file_converter,text_processor,url_fetcher  # empty = all
+# FTMD_TOOLS_DIRECTORY=/app/tools    # auto-detected; override only if needed
 
-# API Configuration
-API_TITLE="FastAPI MCP Template"
-API_VERSION="1.0.0"
-DOCS_URL="/docs"                # API documentation URL
+# Security
+FTMD_API_KEY=                   # if set, X-API-Key required on tool/admin endpoints
+FTMD_CORS_ORIGINS=*             # "*" (no credentials) or comma-separated origins
+
+# Extraction limits
+FTMD_MAX_UPLOAD_BYTES=52428800  # 50 MiB
+FTMD_OCR_MAX_PAGES=50           # 0 = no limit
+FTMD_OCR_LANGUAGES=eng          # tesseract lang(s), e.g. eng+deu
+
+# URL fetching / SSRF
+FTMD_BLOCK_PRIVATE_URLS=true    # block internal/private/metadata addresses
 ```
 
 ### OpenAI Integration Configuration
@@ -632,39 +653,83 @@ Once running, the server provides multiple interfaces:
 - `GET /mcp/session` - Session creation helper endpoint
 
 ### REST API Endpoints
-- `GET /api/health` - Health check endpoint
-- `GET /api/tools` - List all available tools
-- `POST /api/tools/{tool_name}` - Execute a specific tool
-- `GET /api/tools/{tool_name}/schema` - Get tool parameter schema
+- `GET /health`, `GET /api/health` - Health checks
+- `GET /tools` - List all available tools with their schemas
+- `GET /api/tools/{tool_name}/schema` - Get a tool's parameter schema
+- `POST /api/tools/{tool_name}` - Execute a tool via **multipart** (`file` upload + `params` JSON string)
+- `POST /mcp/tools/{tool_name}` - Execute a tool via a **JSON body** (arguments as top-level keys)
+- `GET /metrics`, `GET /api/metrics` - In-process counters (extractions, errors, vision calls + estimated cost)
 - `GET /docs` - Interactive API documentation
 
+### Background jobs (for slow OCR)
+
+Long OCR/vision extractions can be run as background jobs so the request returns
+immediately. Jobs are in-process (not durable across restarts).
+
+- `POST /api/jobs/{tool_name}` - Submit a job (same multipart inputs as `/api/tools/{name}`); returns `202` with a `job_id`
+- `GET /api/jobs/{job_id}` - Poll status (`pending`/`running`/`completed`/`failed`) and fetch the result
+- `GET /api/jobs` - List recent jobs
+
+```bash
+# Submit, then poll
+JID=$(curl -s -X POST http://localhost:8000/api/jobs/file_to_markdown \
+  -F "file=@big-scan.pdf" | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+curl http://localhost:8000/api/jobs/$JID
+```
+
+### MCP protocol notes
+
+The `/mcp` endpoint speaks JSON-RPC 2.0 and supports **batch requests** (send an
+array), negotiates `protocolVersion` (echoes the client's when supported: `2024-11-05`
+or `2025-03-26`), and declares `tools.listChanged: false` (there is no server→client
+push stream). `GET /mcp` returns `405` (SSE streaming is not implemented; use POST).
+
+> **Auth:** if `FTMD_API_KEY` is set, tool-execution and admin endpoints require an
+> `X-API-Key` header. If it is unset (default), auth is disabled — do not expose the
+> service publicly without setting a key.
+
 ### Available Tools
-- `file_to_markdown` - Convert files to Markdown with OCR fallback
+- `file_to_markdown` - Extract files/URLs to Markdown with OCR fallback, chunking, and caching
 - `text_processor` - Process and transform text content
-- `url_fetcher` - Fetch and process content from URLs
+- `url_fetcher` - Fetch web pages/files as Markdown (SSRF-guarded)
 
 ### Example Usage
 
-**Via REST API:**
+**Via REST — JSON body (base64), using the `/mcp/tools/{name}` endpoint:**
 ```bash
 # List available tools
-curl http://localhost:8000/api/tools
+curl http://localhost:8000/tools
 
-# Execute file converter with base64 content
-curl -X POST http://localhost:8000/api/tools/file_to_markdown \
+# Extract a file from base64 content
+curl -X POST http://localhost:8000/mcp/tools/file_to_markdown \
   -H "Content-Type: application/json" \
   -d '{"filename": "document.pdf", "base64_content": "JVBERi0xLjQK..."}'
 
+# Extract a remote document by URL (fetched with SSRF protection)
+curl -X POST http://localhost:8000/mcp/tools/file_to_markdown \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/report.pdf", "chunk_size": 2000}'
+
 # Process text
-curl -X POST http://localhost:8000/api/tools/text_processor \
+curl -X POST http://localhost:8000/mcp/tools/text_processor \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello World", "operation": "uppercase"}'
 
-# Fetch URL content
-curl -X POST http://localhost:8000/api/tools/url_fetcher \
+# Fetch a URL as Markdown
+curl -X POST http://localhost:8000/mcp/tools/url_fetcher \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com"}'
 ```
+
+**Via REST — multipart file upload, using `/api/tools/{name}`:**
+```bash
+# 'file' is the upload; 'params' is a JSON string of extra arguments
+curl -X POST http://localhost:8000/api/tools/file_to_markdown \
+  -F "file=@document.pdf" \
+  -F 'params={"chunk_size": 2000}'
+```
+
+> If `FTMD_API_KEY` is set, add `-H "X-API-Key: <your-key>"` to the calls above.
 
 **Via MCP Protocol:**
 ```bash
@@ -789,17 +854,19 @@ curl -X POST http://localhost:8000/mcp \
 
 #### Debugging
 
-- Check Docker logs: `docker-compose logs fastapi-mcp-template`
-- Check if port 8000 is accessible: `curl http://localhost:8000/mcp`
+- Check Docker logs: `docker compose logs file-extraction-service`
+- Check if port 8000 is accessible: `curl http://localhost:8000/health`
 - Use MCP Inspector's debug features to see the full request/response flow
 
-#### Testing LLM-Enhanced File Conversion
+#### Testing OCR / scanned-document extraction
 
-Test the advanced file conversion capabilities:
+Traditional OCR (Tesseract) runs **without any API key**. The LLM vision model is
+only a second-level fallback, enabled with `FTMD_MARKITDOWN_ENABLE_LLM=true` and an
+OpenAI key.
 
-**Convert an image with enhanced descriptions:**
+**Extract a scanned image (OCR):**
 ```bash
-curl -X POST "http://localhost:8000/api/tools/file_to_markdown" \
+curl -X POST "http://localhost:8000/mcp/tools/file_to_markdown" \
   -H "Content-Type: application/json" \
   -d '{
     "filename": "chart.png",
@@ -807,20 +874,20 @@ curl -X POST "http://localhost:8000/api/tools/file_to_markdown" \
   }'
 ```
 
-**Convert a scanned PDF with OCR fallback:**
+**Extract a scanned PDF (OCR fallback, per-page output):**
 ```bash
-curl -X POST "http://localhost:8000/api/tools/file_to_markdown" \
+curl -X POST "http://localhost:8000/mcp/tools/file_to_markdown" \
   -H "Content-Type: application/json" \
   -d '{
-    "filename": "scanned_document.pdf", 
+    "filename": "scanned_document.pdf",
     "base64_content": "JVBERi0xLjYNJeLjz9MN..."
   }'
 ```
 
-**Expected behavior with LLM integration:**
-- Images: Detailed descriptions of visual content
-- Scanned PDFs: Automatic OCR processing when no text is found
-- Regular PDFs: Standard text extraction with enhanced formatting
+**Extraction behavior:**
+- Text PDFs / Office docs: direct MarkItDown extraction.
+- Scanned PDFs and images: Tesseract OCR (free); the response includes `pages[]` and an `extraction_method` of `ocr` (or `ocr+vision` when the LLM fallback was used).
+- The response reports `success: false` with a warning if no text could be extracted — it never reports success on empty output.
 
 **LLM Integration Troubleshooting:**
 
@@ -879,42 +946,24 @@ The project uses a separated testing approach that mirrors the separation betwee
 
 #### Running Tests
 
-**Via Docker Compose (Development):**
+**Recommended: run the suite with pytest (from the repo root).**
 ```bash
-# Start development container with tests enabled
-docker-compose --profile dev up fastapi-mcp-template-dev
-
-# List available tests
-curl http://localhost:8000/tests
-
-# Check test status
-curl http://localhost:8000/tests/status
-
-# Run all tests via API
-curl -X POST http://localhost:8000/tests/run-all
-
-# Run specific test
-curl -X POST http://localhost:8000/tests/run/test_tools
+pip install pytest pytest-asyncio
+# pytest.ini sets asyncio_mode=auto and the test paths.
+PYTHONPATH=. pytest
 ```
+This runs the tool tests in `tests/` (real extraction, chunking, caching, SSRF)
+and the framework tests in `fastapi_mcp_template/core_test/`.
 
-**Via Environment Variable:**
+**Via the in-app test runner (dev containers only).** Test endpoints are exposed
+only when `FTMD_DEBUG=true`, and require `X-API-Key` when a key is configured:
 ```bash
-# Enable tests in environment
-export ENABLE_TESTS=true
+# Start the dev service (debug + tests enabled)
+docker compose --profile dev up file-extraction-service-dev   # dev is on :8001
 
-# Or in .env file
-echo "ENABLE_TESTS=true" >> .env
-```
-
-**Direct Test Execution:**
-```bash
-# Run core tests
-cd fastapi_mcp_template
-python -m unittest discover core_test
-
-# Run tool tests  
-cd tests
-python -m unittest discover .
+curl http://localhost:8001/tests/status
+curl -X POST http://localhost:8001/tests/run-all
+curl -X POST http://localhost:8001/tests/run/test_tools
 ```
 
 #### Test API Endpoints

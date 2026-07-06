@@ -11,7 +11,9 @@ from pathlib import Path
 
 class TestBase:
     """Base class for all tests with common utilities."""
-    
+
+    __test__ = False  # helper class, not a pytest test case
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config()
@@ -31,7 +33,7 @@ class TestBase:
                 spec.loader.exec_module(config_module)
                 
                 if hasattr(config_module, 'get_settings'):
-                    return config_module.get_settings().dict()
+                    return config_module.get_settings().model_dump()
               # Fallback to basic config
             return {
                 "host": "0.0.0.0",
@@ -98,29 +100,33 @@ class TestBase:
         self.logger.error(f"[TEST ERROR] {message}")
 
 
-class AsyncTestCase(unittest.TestCase):
-    """Base async test case."""
-    
+class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
+    """Base async test case.
+
+    Uses IsolatedAsyncioTestCase so that ``async def test_*`` methods are
+    actually awaited. (Plain unittest.TestCase silently 'passes' coroutine
+    tests without ever running them.)
+    """
+
     def setUp(self):
         """Set up test case."""
         self.test_base = TestBase()
         self.test_base.setup_test_environment()
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-    
+
     def tearDown(self):
         """Tear down test case."""
         self.test_base.cleanup_test_files()
-        self.loop.close()
-    
+
     def run_async(self, coro):
-        """Run async coroutine in test."""
-        return self.loop.run_until_complete(coro)
+        """Run an async coroutine from a synchronous test method."""
+        return asyncio.run(coro)
 
 
 class ToolTestBase(TestBase):
     """Base class for tool testing."""
-    
+
+    __test__ = False  # helper class, not a pytest test case
+
     def __init__(self):
         super().__init__()
         self.test_tools: Dict[str, Any] = {}

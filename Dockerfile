@@ -66,9 +66,10 @@ USER app
 # Expose port
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check (start-period allows time for tool discovery on boot)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
-# Default command
-CMD ["python", "fastapi_mcp_template/main.py", "--host", "0.0.0.0", "--port", "8000"]
+# Default command. Server config comes from FTMD_* env vars (see .env.example),
+# so no CLI flags are passed here.
+CMD ["python", "-m", "fastapi_mcp_template.main"]

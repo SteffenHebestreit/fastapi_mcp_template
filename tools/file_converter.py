@@ -1,13 +1,31 @@
 """
 File to Markdown Converter Tool
 
-This tool converts various file formats to Markdown using the MarkItDown library.
-It's completely self-contained with no imports from the core service.
+Converts various file formats (PDF, Office docs, images, HTML, ...) to
+LLM-ready Markdown using the MarkItDown library, with an OCR fallback for
+scanned PDFs and image files.
+
+Extraction pipeline for scanned/image content (three levels):
+  1. Traditional OCR (pytesseract, then easyocr) — fast, free, no LLM needed.
+  2. LLM vision analysis — used only when an OpenAI-compatible client is
+     configured and level 1 yields too little text.
+  3. Combination — pick the richer of the two per page.
+
+The tool is self-contained (no imports from the core service) and reads its
+configuration from ``tool_base.config``.
 """
 
 import io
+import re
 import base64
-from typing import Dict, Any
+import socket
+import asyncio
+import hashlib
+import binascii
+import ipaddress
+from collections import OrderedDict
+from urllib.parse import urlparse, unquote
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
 try:
@@ -16,629 +34,708 @@ except ImportError:
     MarkItDown = None
 
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+# Below this many characters, MarkItDown output for a PDF/image is treated as a
+# failed extraction and the OCR fallback is attempted.
+MIN_USEFUL_CHARS = 16
+
+# Approximate LLM vision pricing, USD per 1M tokens (prompt, completion).
+VISION_PRICING = {
+    "gpt-4o": (2.5, 10.0),
+    "gpt-4o-mini": (0.15, 0.6),
+    "gpt-4-turbo": (10.0, 30.0),
+}
+DEFAULT_VISION_PRICING = (2.5, 10.0)
+
+
 class ToolDefinition:
     """Definition structure for a tool."""
-    
+
     def __init__(self, name: str, description: str, endpoint: str, tool_type: str, version: str = "1.0.0"):
         self.name = name
         self.description = description
         self.endpoint = endpoint
-        self.tool_type = tool_type  # Now accepts any string
+        self.tool_type = tool_type
         self.version = version
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "endpoint": self.endpoint,
-            "type": self.tool_type,  # Direct string value
-            "version": self.version
+            "type": self.tool_type,
+            "version": self.version,
         }
 
 
 class ToolSchema:
     """Schema definition for tool parameters."""
-    
+
     def __init__(self, properties: Dict[str, Any], required: list = None):
         self.properties = properties
         self.required = required or []
-    
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": self.properties,
-            "required": self.required
-        }
+        return {"type": "object", "properties": self.properties, "required": self.required}
 
 
 class ToolInterface:
     """Interface that tools must implement."""
-    
+
     def get_definition(self) -> ToolDefinition:
         raise NotImplementedError
-    
+
     def get_schema(self) -> ToolSchema:
         raise NotImplementedError
-    
+
     async def execute(self, **kwargs) -> Dict[str, Any]:
         raise NotImplementedError
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars/token) without pulling in a tokenizer dep."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def chunk_markdown(text: str, chunk_size: int, overlap: int = 0) -> List[str]:
+    """Split text into ~chunk_size-character chunks on paragraph boundaries.
+
+    Overlap is applied by carrying the tail of the previous chunk forward, which
+    helps retrieval keep context across chunk edges.
+    """
+    if chunk_size <= 0 or len(text) <= chunk_size:
+        return [text] if text else []
+
+    # Split into paragraph-sized units, further hard-splitting any single
+    # paragraph that is itself larger than chunk_size.
+    units: List[str] = []
+    for para in re.split(r"\n\s*\n", text):
+        if len(para) <= chunk_size:
+            units.append(para)
+        else:
+            for i in range(0, len(para), chunk_size):
+                units.append(para[i : i + chunk_size])
+
+    chunks: List[str] = []
+    current = ""
+    for unit in units:
+        if current and len(current) + len(unit) + 2 > chunk_size:
+            chunks.append(current.strip())
+            current = (current[-overlap:] if overlap else "") + unit
+        else:
+            current = f"{current}\n\n{unit}" if current else unit
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+
 class FileToMarkdownConverter(ToolInterface):
-    """Converts various file formats to Markdown."""
-    
+    """Converts various file formats to Markdown, with OCR fallback."""
+
     def __init__(self, tool_base):
         self.tool_base = tool_base
+        self.config = getattr(tool_base, "config", {}) if tool_base else {}
         self.markitdown = None
+        self.llm_client = None
+        self._easyocr_reader = None  # lazily constructed and reused across requests
+        # Content-hash keyed LRU cache so identical files aren't re-OCR'd / re-billed.
+        self._cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         if MarkItDown:
             self._initialize_markitdown()
 
-    def _initialize_markitdown(self):
-        """Initialize MarkItDown with optional OpenAI integration."""
-        try:
-            # Get configuration from tool_base if available
-            config = getattr(self.tool_base, 'config', {}) if self.tool_base else {}
-            
-            if self.tool_base and hasattr(self.tool_base, 'log_info'):
-                self.tool_base.log_info(f"Config keys available: {list(config.keys()) if isinstance(config, dict) else 'None'}")
-            
-            # Check if LLM features are enabled
-            enable_llm = config.get('markitdown_enable_llm', False)
-            openai_api_key = config.get('openai_api_key')
-            openai_base_url = config.get('openai_base_url')
-            openai_model = config.get('openai_model', 'gpt-4o')
-            
-            # Log configuration values
-            if self.tool_base and hasattr(self.tool_base, 'log_info'):
-                self.tool_base.log_info(f"LLM enabled: {enable_llm}")
-                self.tool_base.log_info(f"OpenAI API key present: {bool(openai_api_key)}")
-                self.tool_base.log_info(f"OpenAI base URL: {openai_base_url}")
-                self.tool_base.log_info(f"OpenAI model: {openai_model}")
-            
-            if enable_llm and openai_api_key:
-                try:
-                    from openai import OpenAI
-                    
-                    # Initialize OpenAI client
-                    client_kwargs = {'api_key': openai_api_key}
-                    if openai_base_url:
-                        client_kwargs['base_url'] = openai_base_url
-                    
-                    client = OpenAI(**client_kwargs)
-                    
-                    # Initialize MarkItDown with LLM support
-                    try:
-                        self.markitdown = MarkItDown(
-                            llm_client=client,
-                            llm_model=openai_model,
-                            enable_plugins=True
-                        )
-                        if self.tool_base:
-                            self.tool_base.log_info("MarkItDown initialized with LLM support")
-                    except TypeError as e:
-                        # Try alternative initialization approaches
-                        if self.tool_base:
-                            self.tool_base.log_warning(f"Direct LLM initialization failed: {e}")
-                        
-                        try:
-                            self.markitdown = MarkItDown(
-                                enable_plugins=True,
-                                **{'llm_client': client, 'llm_model': openai_model}
-                            )
-                            if self.tool_base:
-                                self.tool_base.log_info("MarkItDown initialized with LLM support (kwargs)")
-                        except Exception as e:
-                            if self.tool_base:
-                                self.tool_base.log_warning(f"Kwargs initialization failed: {e}")
-                            
-                            # Fallback: create instance then set attributes
-                            self.markitdown = MarkItDown(enable_plugins=True)
-                            try:
-                                self.markitdown.llm_client = client
-                                self.markitdown.llm_model = openai_model
-                                if self.tool_base:
-                                    self.tool_base.log_info("LLM client set on MarkItDown instance")
-                            except Exception as e:
-                                try:
-                                    self.markitdown._llm_client = client
-                                    self.markitdown._llm_model = openai_model
-                                    if self.tool_base:
-                                        self.tool_base.log_info("LLM client set as private attributes")
-                                except Exception as e:
-                                    if self.tool_base:
-                                        self.tool_base.log_warning(f"Failed to set LLM client: {e}")
-                    
-                    if self.tool_base:
-                        self.tool_base.log_info(f"MarkItDown initialized with OpenAI model: {openai_model}")
-                    
-                except ImportError:
-                    # OpenAI not available, fall back to basic MarkItDown
-                    self.markitdown = MarkItDown(enable_plugins=False)
-                    if self.tool_base and hasattr(self.tool_base, 'log_warning'):
-                        self.tool_base.log_warning("OpenAI library not available, using basic MarkItDown")
-                except Exception as e:
-                    # Error with OpenAI setup, fall back to basic MarkItDown
-                    self.markitdown = MarkItDown(enable_plugins=False)
-                    if self.tool_base and hasattr(self.tool_base, 'log_warning'):
-                        self.tool_base.log_warning(f"OpenAI setup failed, using basic MarkItDown: {e}")
-            else:
-                # Use basic MarkItDown without LLM features
-                self.markitdown = MarkItDown(enable_plugins=False)
-                
-        except Exception as e:
-            # Fallback to basic MarkItDown
-            self.markitdown = MarkItDown(enable_plugins=False)
-            if self.tool_base and hasattr(self.tool_base, 'log_error'):
-                self.tool_base.log_error(f"Error initializing MarkItDown: {e}")
+    # ------------------------------------------------------------------ setup
 
-    async def _ocr_pdf_with_fallback(self, pdf_content: bytes, llm_client) -> str:
-        """
-        Enhanced PDF OCR with three-level fallback:
-        1. Traditional OCR (pytesseract/easyocr) - fast and cost-effective
-        2. LLM vision analysis - for complex layouts and handwriting
-        3. Combination approach - if needed
-        """
-        try:
-            # Try to import required libraries for PDF to image conversion
+    def _cfg(self, key: str, default: Any = None) -> Any:
+        return self.config.get(key, default) if isinstance(self.config, dict) else default
+
+    def _log(self, level: str, message: str) -> None:
+        if not self.tool_base:
+            return
+        fn = getattr(self.tool_base, f"log_{level}", None)
+        if fn:
+            fn(message)
+
+    def _debug(self, message: str) -> None:
+        if self._cfg("verbose_debug", False):
+            self._log("info", message)
+
+    def _initialize_markitdown(self):
+        """Initialize MarkItDown, wiring an OpenAI client only if configured."""
+        enable_llm = self._cfg("markitdown_enable_llm", False)
+        api_key = self._cfg("openai_api_key")
+
+        if enable_llm and api_key:
             try:
-                import fitz  # PyMuPDF
-            except ImportError:
-                self.tool_base.log_error("PyMuPDF not available - cannot convert PDF to images for OCR")
-                return ""
-            
-            self.tool_base.log_info("Converting PDF pages to images for enhanced OCR...")
-            
-            # Open PDF with PyMuPDF
-            pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
-            extracted_text = []
-            
-            # Process first few pages (limit to avoid excessive processing)
-            max_pages = min(5, pdf_doc.page_count)
-            self.tool_base.log_info(f"Processing {max_pages} pages out of {pdf_doc.page_count} total pages")
-            
-            for page_num in range(max_pages):
-                page = pdf_doc[page_num]
-                
-                # Convert page to image
-                mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for better quality
-                pix = page.get_pixmap(matrix=mat)
-                img_data = pix.tobytes("png")
-                
-                self.tool_base.log_info(f"Processing page {page_num + 1}...")
-                
-                # Level 1: Try traditional OCR first (fast and free)
-                ocr_text = await self._extract_text_with_ocr(img_data, page_num + 1)
-                
-                if ocr_text and len(ocr_text.strip()) > 50:  # Good OCR result
-                    extracted_text.append(f"# Page {page_num + 1}\n\n{ocr_text.strip()}\n\n")
-                    self.tool_base.log_info(f"Successfully extracted {len(ocr_text)} characters from page {page_num + 1} using OCR")
-                    continue
-                
-                # Level 2: Fall back to LLM vision analysis
-                self.tool_base.log_info(f"OCR yield insufficient, trying LLM vision analysis for page {page_num + 1}")
-                llm_text = await self._extract_text_with_llm(img_data, llm_client, page_num + 1)
-                
-                if llm_text and llm_text.strip():
-                    extracted_text.append(f"# Page {page_num + 1}\n\n{llm_text.strip()}\n\n")
-                    self.tool_base.log_info(f"Extracted {len(llm_text)} characters from page {page_num + 1} using LLM")
-                else:
-                    # Level 3: Combination approach (if both methods found something)
-                    if ocr_text and ocr_text.strip():
-                        combined_text = await self._combine_ocr_and_llm(ocr_text, llm_text, page_num + 1)
-                        extracted_text.append(f"# Page {page_num + 1}\n\n{combined_text}\n\n")
-                    else:
-                        self.tool_base.log_warning(f"No text could be extracted from page {page_num + 1}")
-            
-            pdf_doc.close()
-            
-            # Combine all extracted text
-            full_text = "\n".join(extracted_text)
-            self.tool_base.log_info(f"Enhanced OCR completed. Total extracted text length: {len(full_text)}")
-            
-            return full_text
-            
-        except Exception as e:
-            self.tool_base.log_error(f"Enhanced OCR failed: {e}")
-            return ""
-    
-    async def _extract_text_with_ocr(self, img_data: bytes, page_num: int) -> str:
-        """Extract text using traditional OCR (pytesseract or easyocr)."""
-        try:
-            # Try pytesseract first (most common)
-            try:
-                import pytesseract
-                from PIL import Image
-                import io
-                
-                # Convert image data to PIL Image
-                image = Image.open(io.BytesIO(img_data))
-                
-                # Extract text with pytesseract
-                text = pytesseract.image_to_string(image, config='--psm 6')
-                self.tool_base.log_info(f"Pytesseract extracted {len(text)} characters from page {page_num}")
-                return text
-                
-            except ImportError:
-                self.tool_base.log_info("Pytesseract not available, trying easyocr...")
-                
-                # Try easyocr as fallback
-                try:
-                    import easyocr
-                    import numpy as np
-                    from PIL import Image
-                    import io
-                    
-                    # Convert image to numpy array
-                    image = Image.open(io.BytesIO(img_data))
-                    img_array = np.array(image)
-                    
-                    # Initialize EasyOCR reader (English by default)
-                    reader = easyocr.Reader(['en'])
-                    
-                    # Extract text
-                    results = reader.readtext(img_array)
-                    
-                    # Combine all detected text
-                    text = '\n'.join([result[1] for result in results])
-                    self.tool_base.log_info(f"EasyOCR extracted {len(text)} characters from page {page_num}")
-                    return text
-                    
-                except ImportError:
-                    self.tool_base.log_warning("Neither pytesseract nor easyocr available for traditional OCR")
-                    return ""
-                    
-        except Exception as e:
-            self.tool_base.log_error(f"Traditional OCR failed for page {page_num}: {e}")
-            return ""
-    
-    async def _extract_text_with_llm(self, img_data: bytes, llm_client, page_num: int) -> str:
-        """Extract text using LLM vision analysis."""
-        try:
-            # Convert to base64 for LLM
-            import base64
-            img_base64 = base64.b64encode(img_data).decode()
-            
-            # Use LLM to extract text from image
-            response = llm_client.chat.completions.create(
-                model=getattr(self.markitdown, '_llm_model', 'gpt-4o'),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Please extract all text from this image. Return only the text content, maintaining the original structure and formatting as much as possible. If there are multiple columns, preserve the reading order."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{img_base64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=4000
-            )
-            
-            text = response.choices[0].message.content
-            return text if text else ""
-            
-        except Exception as e:
-            self.tool_base.log_error(f"LLM vision analysis failed for page {page_num}: {e}")
-            return ""
-    
-    async def _combine_ocr_and_llm(self, ocr_text: str, llm_text: str, page_num: int) -> str:
-        """Combine OCR and LLM results for better accuracy."""
-        try:
-            # If we have both results, prefer the longer/more complete one
-            if not llm_text or not llm_text.strip():
-                return ocr_text
-            
-            if not ocr_text or not ocr_text.strip():
-                return llm_text
-              # If both exist, use the one with more content
-            if len(llm_text.strip()) > len(ocr_text.strip()) * 1.5:
-                self.tool_base.log_info(f"Using LLM result for page {page_num} (more comprehensive)")
-                return llm_text
-            else:
-                self.tool_base.log_info(f"Using OCR result for page {page_num} (sufficient quality)")
-                return ocr_text
-                
-        except Exception as e:
-            self.tool_base.log_error(f"Failed to combine OCR and LLM results for page {page_num}: {e}")
-            return ocr_text or llm_text or ""
+                from openai import OpenAI
+
+                client_kwargs = {"api_key": api_key}
+                base_url = self._cfg("openai_base_url")
+                if base_url:
+                    client_kwargs["base_url"] = base_url
+                self.llm_client = OpenAI(**client_kwargs)
+                self.markitdown = MarkItDown(
+                    llm_client=self.llm_client,
+                    llm_model=self._cfg("openai_model", "gpt-4o"),
+                    enable_plugins=True,
+                )
+                self._log("info", "MarkItDown initialized with LLM vision support")
+                return
+            except Exception as e:  # noqa: BLE001 - fall back to basic mode
+                self.llm_client = None
+                self._log("warning", f"LLM setup failed, using basic MarkItDown: {e}")
+
+        self.markitdown = MarkItDown(enable_plugins=False)
+
+    # --------------------------------------------------------------- schema
 
     def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="file_to_markdown",
-            description="Convert various file formats (PDF, DOCX, images, etc.) to Markdown",
+            description=(
+                "Extract text from a file (PDF, DOCX, XLSX, PPTX, images, HTML, ...) as "
+                "LLM-ready Markdown. Provide the file as base64 via 'base64_content' (for "
+                "MCP/JSON clients) or as a multipart upload via the REST endpoint. Scanned "
+                "PDFs and images fall back to OCR automatically. Returns markdown plus "
+                "per-page text, a token estimate, and optional chunks."
+            ),
             endpoint="/convert",
-            tool_type="converter",  # Direct string instead of enum
-            version="1.0.0"
+            tool_type="converter",
+            version="2.0.0",
         )
-    
+
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
             properties={
-                "file_content": {
-                    "type": "string",
-                    "format": "binary",
-                    "description": "File content as bytes"
-                },
                 "filename": {
                     "type": "string",
-                    "description": "Original filename with extension"
+                    "description": "Original filename with extension (used to pick the converter). "
+                                   "Optional when 'url' is given.",
                 },
-                "content_type": {
+                "url": {
                     "type": "string",
-                    "description": "MIME type of the file"
+                    "format": "uri",
+                    "description": "http(s) URL of a remote document to fetch and extract. "
+                                   "Internal/private addresses are blocked.",
                 },
                 "base64_content": {
                     "type": "string",
-                    "description": "Base64 encoded file content (alternative to file_content)"
-                }
+                    "description": "Base64-encoded file content. Preferred input for MCP/JSON clients.",
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": "Optional MIME type of the file.",
+                },
+                "chunk_size": {
+                    "type": "integer",
+                    "description": "If > 0, also return the markdown split into chunks of about this many characters.",
+                },
+                "chunk_overlap": {
+                    "type": "integer",
+                    "description": "Character overlap between chunks (default 0).",
+                },
             },
-            required=["filename"]
+            # One of base64_content / url (or a multipart file_content on the REST
+            # path) must be supplied; filename is derived from the URL when absent.
+            required=[],
         )
-    
+
+    # -------------------------------------------------------------- execute
+
     async def execute(self, **kwargs) -> Dict[str, Any]:
-        """Convert file to markdown."""
-        # Debug incoming parameters
-        if self.tool_base:
-            self.tool_base.log_info(f"Execute called with parameters: {list(kwargs.keys())}")
-            self.tool_base.log_info(f"Filename: {kwargs.get('filename')}")
-            self.tool_base.log_info(f"Has file_content: {bool(kwargs.get('file_content'))}")
-            self.tool_base.log_info(f"Has base64_content: {bool(kwargs.get('base64_content'))}")
-            if kwargs.get('base64_content'):
-                self.tool_base.log_info(f"Base64 content length: {len(kwargs.get('base64_content'))}")
-        
         if not self.markitdown:
-            return {
-                "success": False,
-                "error": "MarkItDown library not available"
-            }
-        
+            return self._error(kwargs.get("filename"), "MarkItDown library not available")
+
         filename = kwargs.get("filename")
-        if not filename:
-            return {
-                "success": False,
-                "error": "filename is required"
-            }
-          # Get file content
+        url = kwargs.get("url")
+        max_bytes = int(self._cfg("max_upload_bytes", 50 * 1024 * 1024) or 0)
+
+        # Resolve raw bytes from multipart file_content, base64_content, or a URL.
+        source = "upload"
         file_content = kwargs.get("file_content")
         base64_content = kwargs.get("base64_content")
-        
-        if base64_content:
-            try:
-                # Clean up base64 content - remove whitespace and fix padding if needed
-                base64_clean = base64_content.strip().replace('\n', '').replace('\r', '').replace(' ', '')
-                
-                # Fix padding if necessary
-                missing_padding = len(base64_clean) % 4
-                if missing_padding:
-                    base64_clean += '=' * (4 - missing_padding)
-                
-                if self.tool_base:
-                    self.tool_base.log_info(f"Original base64 length: {len(base64_content)}")
-                    self.tool_base.log_info(f"Cleaned base64 length: {len(base64_clean)}")
-                    self.tool_base.log_info(f"Base64 starts with: {base64_clean[:20]}...")
-                    self.tool_base.log_info(f"Base64 ends with: ...{base64_clean[-20:]}")
-                
-                file_content = base64.b64decode(base64_clean)
-                
-                # Debug the decoded content
-                if self.tool_base:
-                    self.tool_base.log_info(f"Base64 decoded successfully, content length: {len(file_content)}")
-                    # Check if it looks like a PDF by examining the header
-                    if len(file_content) >= 8:
-                        header = file_content[:8]
-                        self.tool_base.log_info(f"File header bytes: {header}")
-                        self.tool_base.log_info(f"File header as string: {header.decode('latin-1', errors='ignore')}")
-                        # PDF files should start with %PDF
-                        if header.startswith(b'%PDF'):
-                            self.tool_base.log_info("File appears to be a valid PDF based on header")
-                        else:
-                            self.tool_base.log_warning("File does not appear to be a PDF - missing %PDF header")
-            except Exception as e:
-                if self.tool_base:
-                    self.tool_base.log_error(f"Base64 decode error: {str(e)}")
-                return {
-                    "success": False,
-                    "error": f"Invalid base64 content: {str(e)}"
-                }
-        
+        if file_content is None and base64_content:
+            source = "base64"
+            decoded, err = self._decode_base64(base64_content)
+            if err:
+                return self._error(filename, err)
+            file_content = decoded
+        elif file_content is None and not base64_content and url:
+            source = "url"
+            if not filename:
+                filename = self._filename_from_url(url)
+            fetched, err = await self._fetch_url(url, max_bytes)
+            if err:
+                return self._error(filename, err)
+            file_content = fetched
+
+        if not filename:
+            return self._error(None, "Provide 'filename' (with base64_content/upload) or 'url'")
+
+        if isinstance(file_content, str):
+            file_content = file_content.encode("utf-8")
         if not file_content:
-            return {
-                "success": False,
-                "error": "No file content provided"
-            }
-        
-        try:
-            # Create a BytesIO object from the content
-            if isinstance(file_content, str):
-                file_content = file_content.encode('utf-8')
-            
-            file_stream = io.BytesIO(file_content)
-              # Debug file stream
-            if self.tool_base:
-                self.tool_base.log_info(f"File stream created, size: {len(file_content)} bytes")
-                self.tool_base.log_info(f"File extension: {Path(filename).suffix.lower()}")
-            
-            # Convert using MarkItDown
-            if self.tool_base:
-                self.tool_base.log_info("Starting MarkItDown conversion...")
-                self.tool_base.log_info(f"MarkItDown instance: {self.markitdown}")
-                
-                # Check for LLM client in multiple possible locations
-                llm_client_found = False
-                llm_client = None
-                
-                if hasattr(self.markitdown, 'llm_client') and self.markitdown.llm_client:
-                    llm_client = self.markitdown.llm_client
-                    llm_client_found = True
-                    self.tool_base.log_info(f"LLM client found at llm_client: {llm_client}")
-                elif hasattr(self.markitdown, '_llm_client') and self.markitdown._llm_client:
-                    llm_client = self.markitdown._llm_client
-                    llm_client_found = True
-                    self.tool_base.log_info(f"LLM client found at _llm_client: {llm_client}")
-                else:
-                    self.tool_base.log_info("No LLM client found")
-                
-                self.tool_base.log_info(f"LLM client available: {llm_client_found}")
-                
-                # Check what converters are available and which one will be used
-                try:
-                    converters = getattr(self.markitdown, '_converters', [])
-                    if isinstance(converters, list):
-                        converter_names = []
-                        for conv in converters:
-                            try:
-                                # Try to get converter name/type
-                                conv_name = str(type(conv).__name__)
-                                converter_names.append(conv_name)
-                            except:
-                                converter_names.append(str(conv))
-                        self.tool_base.log_info(f"Available converters: {converter_names}")
-                        
-                        # Try to determine which converter will be used for this file
-                        file_ext = Path(filename).suffix.lower()
-                        self.tool_base.log_info(f"File extension: {file_ext}")
-                        
-                        # Look for PDF-specific converter
-                        pdf_converters = [conv for conv in converter_names if 'pdf' in conv.lower() or 'Pdf' in conv]
-                        if pdf_converters:
-                            self.tool_base.log_info(f"PDF converters found: {pdf_converters}")
-                        else:
-                            self.tool_base.log_info("No obvious PDF converters found")
-                            
-                    elif isinstance(converters, dict):
-                        self.tool_base.log_info(f"Available converters (dict): {list(converters.keys())}")
-                    else:
-                        self.tool_base.log_info(f"Converters type: {type(converters)}, value: {converters}")
-                except Exception as e:
-                    self.tool_base.log_info(f"Could not get converters: {e}")
-                
-                # Also check for other converter-related attributes
-                try:
-                    for attr in ['converters', 'converter_registry', '_converter_registry']:
-                        if hasattr(self.markitdown, attr):
-                            attr_value = getattr(self.markitdown, attr)
-                            self.tool_base.log_info(f"MarkItDown.{attr}: {type(attr_value)} = {attr_value}")
-                except Exception as e:
-                    self.tool_base.log_info(f"Error checking converter attributes: {e}")
-            
-            result = self.markitdown.convert_stream(
-                file_stream,
-                file_extension=Path(filename).suffix.lower(),
-                filename=filename
+            return self._error(filename, "No file content provided (expected base64_content, upload, or url)")
+
+        if max_bytes and len(file_content) > max_bytes:
+            return self._error(
+                filename,
+                f"File too large: {len(file_content)} bytes exceeds limit of {max_bytes} bytes",
             )
-            
-            if self.tool_base:
-                self.tool_base.log_info("MarkItDown conversion completed")
-                
-                # Debug the result more thoroughly
-                self.tool_base.log_info(f"Result type: {type(result)}")
-                self.tool_base.log_info(f"Result dir: {[attr for attr in dir(result) if not attr.startswith('__')]}")
-                
-                # Check the markdown content
-                if hasattr(result, 'markdown'):
-                    markdown_content = result.markdown
-                    self.tool_base.log_info(f"Markdown content length: {len(markdown_content) if markdown_content else 0}")
-                    if markdown_content and len(markdown_content.strip()) > 0:
-                        self.tool_base.log_info(f"Markdown preview: {markdown_content[:300]}...")
-                    else:
-                        self.tool_base.log_info("Markdown is empty or whitespace only")
-                else:
-                    self.tool_base.log_info("Result has no 'markdown' attribute")
-                
-                # Check text_content if available
-                if hasattr(result, 'text_content'):
-                    text_content = result.text_content
-                    self.tool_base.log_info(f"Text content length: {len(text_content) if text_content else 0}")
-                    if text_content and len(text_content.strip()) > 0:
-                        self.tool_base.log_info(f"Text content preview: {text_content[:300]}...")
-                    else:
-                        self.tool_base.log_info("Text content is empty or whitespace only")
-                else:
-                    self.tool_base.log_info("Result has no 'text_content' attribute")
-                  # For PDFs specifically, check if this might be a scanned/image-based PDF
-                if Path(filename).suffix.lower() == '.pdf':
-                    self.tool_base.log_info("Processing PDF file - checking for text extraction issues")
-                    
-                    # If we got empty results from a PDF, it might be scanned
-                    if (not hasattr(result, 'markdown') or not result.markdown or len(result.markdown.strip()) == 0):
-                        self.tool_base.log_info("PDF returned empty markdown - this might be a scanned/image-based PDF")
-                        self.tool_base.log_info("MarkItDown's PDF converter may not handle scanned documents well")
-                        
-                        # For now, just log this. In a future version, we could add OCR here
-                        # by converting PDF pages to images and using the LLM on those images
-                        if llm_client_found and llm_client:
-                            self.tool_base.log_info(f"LLM client is available ({type(llm_client)}) - could potentially add OCR for scanned PDFs")
-                            self.tool_base.log_info("This scanned PDF could benefit from OCR processing using the LLM")
-                            
-                            # Try to implement OCR fallback for scanned PDFs
-                            try:
-                                self.tool_base.log_info("Attempting OCR fallback for scanned PDF...")
-                                ocr_result = await self._ocr_pdf_with_fallback(file_content, llm_client)
-                                if ocr_result and ocr_result.strip():
-                                    self.tool_base.log_info(f"OCR successful! Extracted {len(ocr_result)} characters")
-                                    # Override the empty result with OCR content
-                                    result.markdown = ocr_result
-                                    result.text_content = ocr_result
-                                    self.tool_base.log_info(f"OCR result preview: {ocr_result[:200]}...")
-                                else:
-                                    self.tool_base.log_info("OCR did not extract any content")
-                            except Exception as e:
-                                self.tool_base.log_error(f"OCR fallback failed: {e}")
-                        else:
-                            self.tool_base.log_info("No LLM client available for OCR enhancement")
-            
-            # Debug logging
-            if self.tool_base:
-                self.tool_base.log_info(f"MarkItDown result type: {type(result)}")
-                self.tool_base.log_info(f"MarkItDown result attributes: {dir(result)}")
-                self.tool_base.log_info(f"MarkItDown markdown length: {len(result.markdown) if hasattr(result, 'markdown') and result.markdown else 0}")
-                self.tool_base.log_info(f"MarkItDown title: {result.title if hasattr(result, 'title') else 'No title'}")
-                if hasattr(result, 'markdown') and result.markdown:
-                    self.tool_base.log_info(f"MarkItDown markdown preview (first 200 chars): {result.markdown[:200]}")
-                else:
-                    self.tool_base.log_info("MarkItDown markdown is empty or None")
-            
-            # Log success
-            if self.tool_base:
-                self.tool_base.log_info(f"Successfully converted {filename} to markdown")
-                self.tool_base.record_metric("conversion.success", 1)
-            
-            # Create response
-            response = {
-                "success": True,
-                "markdown": result.markdown,
-                "title": result.title,
-                "filename": filename,
-                "content_type": kwargs.get("content_type"),
-                "size": len(file_content)
-            }
-            
-            # Debug the response
-            if self.tool_base:
-                self.tool_base.log_info(f"Response keys: {list(response.keys())}")
-                self.tool_base.log_info(f"Response markdown length: {len(response.get('markdown', ''))}")
-                self.tool_base.log_info(f"Response structure: success={response['success']}, title='{response['title']}', size={response['size']}")
-            
-            return response
-            
-        except Exception as e:
-            error_msg = f"Conversion failed: {str(e)}"
-            if self.tool_base:
-                self.tool_base.log_error(error_msg)
-                self.tool_base.record_metric("conversion.error", 1)
-            
+
+        cache_key = self._cache_key(filename, file_content, kwargs)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            self._debug(f"Cache hit for {filename}")
+            return {**cached, "cached": True}
+
+        try:
+            result = await self._convert(filename, file_content, kwargs.get("content_type"), source, kwargs)
+            if result.get("success"):
+                self._cache_put(cache_key, result)
+            return result
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"Conversion failed for {filename}: {e}")
+            self.tool_base and self.tool_base.record_metric("conversion.error", 1)
+            return self._error(filename, f"Conversion failed: {e}")
+
+    def _decode_base64(self, data: str) -> Tuple[Optional[bytes], Optional[str]]:
+        """Decode base64, tolerating line wraps and data: URIs but rejecting corruption."""
+        cleaned = data.strip()
+        if cleaned.startswith("data:") and "," in cleaned:
+            cleaned = cleaned.split(",", 1)[1]
+        cleaned = re.sub(r"\s+", "", cleaned)
+        # Pad to a multiple of 4 (some clients strip trailing '='); validate=True
+        # still rejects any non-alphabet characters, so genuine corruption fails.
+        missing = len(cleaned) % 4
+        if missing:
+            cleaned += "=" * (4 - missing)
+        try:
+            return base64.b64decode(cleaned, validate=True), None
+        except (binascii.Error, ValueError) as e:
+            return None, f"Invalid base64 content: {e}"
+
+    async def _convert(
+        self,
+        filename: str,
+        file_content: bytes,
+        content_type: Optional[str],
+        source: str,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ext = Path(filename).suffix.lower()
+        warnings: List[str] = []
+        pages: List[Dict[str, Any]] = []
+        method = "markitdown"
+        page_count: Optional[int] = None
+        pages_processed: Optional[int] = None
+        truncated = False
+
+        # Per-request accounting for paid LLM-vision calls.
+        vision_stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0, "capped": False}
+
+        # Primary path: MarkItDown (runs off the event loop; it is synchronous).
+        markdown = ""
+        title = None
+        if ext in IMAGE_EXTENSIONS:
+            # Images: go straight to OCR; MarkItDown only describes images when an
+            # LLM is configured, whereas OCR extracts actual text for free.
+            self._debug(f"Image file {filename}: using OCR pipeline")
+        else:
+            result = await asyncio.to_thread(
+                self.markitdown.convert_stream,
+                io.BytesIO(file_content),
+                file_extension=ext,
+                filename=filename,
+            )
+            markdown = (getattr(result, "markdown", None) or getattr(result, "text_content", None) or "")
+            title = getattr(result, "title", None)
+
+        # OCR fallback for scanned PDFs and images, regardless of LLM availability.
+        if len((markdown or "").strip()) < MIN_USEFUL_CHARS:
+            if ext == ".pdf":
+                self._log("info", f"{filename}: MarkItDown yielded little text; running OCR fallback")
+                ocr_md, pages, page_count, pages_processed, truncated, method = await self._ocr_pdf(
+                    file_content, vision_stats
+                )
+                if ocr_md.strip():
+                    markdown = ocr_md
+            elif ext in IMAGE_EXTENSIONS:
+                text, used = await self._ocr_image(file_content, 1, vision_stats)
+                if text.strip():
+                    markdown = text
+                    method = used
+                    pages = [{"page": 1, "text": text, "method": used}]
+                    page_count = pages_processed = 1
+
+        self._record_vision_metrics(vision_stats)
+        if vision_stats["capped"]:
+            warnings.append(
+                f"Vision-call cap reached (vision_max_calls_per_request="
+                f"{self._cfg('vision_max_calls_per_request', 0)}); some pages used traditional OCR only."
+            )
+
+        markdown = (markdown or "").strip()
+
+        if not markdown:
+            warnings.append("No text could be extracted from the document.")
+            self.tool_base and self.tool_base.record_metric("conversion.empty", 1)
             return {
                 "success": False,
-                "error": error_msg,
-                "filename": filename
+                "error": "No text could be extracted",
+                "filename": filename,
+                "content_type": content_type,
+                "size": len(file_content),
+                "warnings": warnings,
+                "metadata": self._metadata(method, page_count, pages_processed, truncated, source, 0),
             }
+
+        if truncated:
+            warnings.append(
+                f"Only the first {pages_processed} of {page_count} pages were OCR-processed "
+                f"(limit ocr_max_pages={self._cfg('ocr_max_pages', 50)})."
+            )
+
+        metadata = self._metadata(
+            method, page_count, pages_processed, truncated, source, estimate_tokens(markdown)
+        )
+        if vision_stats["calls"]:
+            metadata["vision"] = {
+                "calls": vision_stats["calls"],
+                "prompt_tokens": vision_stats["prompt_tokens"],
+                "completion_tokens": vision_stats["completion_tokens"],
+                "estimated_cost_usd": round(vision_stats["cost_usd"], 6),
+            }
+
+        response: Dict[str, Any] = {
+            "success": True,
+            "filename": filename,
+            "content_type": content_type,
+            "size": len(file_content),
+            "title": title,
+            "markdown": markdown,
+            "metadata": metadata,
+        }
+        if pages:
+            response["pages"] = pages
+        if warnings:
+            response["warnings"] = warnings
+
+        chunk_size = int(kwargs.get("chunk_size") or 0)
+        if chunk_size > 0:
+            overlap = int(kwargs.get("chunk_overlap") or 0)
+            chunks = chunk_markdown(markdown, chunk_size, overlap)
+            response["chunks"] = [
+                {"index": i, "text": c, "token_estimate": estimate_tokens(c)} for i, c in enumerate(chunks)
+            ]
+
+        self.tool_base and self.tool_base.record_metric("conversion.success", 1)
+        self._log("info", f"Extracted {len(markdown)} chars from {filename} via {method}")
+        return response
+
+    def _metadata(self, method, page_count, pages_processed, truncated, source, tokens) -> Dict[str, Any]:
+        return {
+            "extraction_method": method,
+            "page_count": page_count,
+            "pages_processed": pages_processed,
+            "truncated": truncated,
+            "source": source,
+            "token_estimate": tokens,
+            # Provenance marker: extracted content is untrusted and may contain
+            # instructions aimed at a downstream LLM. Callers should not treat it
+            # as trusted/system content.
+            "content_trust": "untrusted",
+        }
+
+    @staticmethod
+    def _error(filename: Optional[str], message: str) -> Dict[str, Any]:
+        return {"success": False, "error": message, "filename": filename}
+
+    # ------------------------------------------------------------ remote URL
+
+    @staticmethod
+    def _filename_from_url(url: str) -> str:
+        path = urlparse(url).path
+        name = unquote(Path(path).name) if path else ""
+        return name or "download"
+
+    def _host_ok(self, url: str) -> Optional[str]:
+        """Return None if the URL is safe to fetch, else an error string (SSRF guard)."""
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return f"Unsupported URL scheme: {parsed.scheme or '(none)'}"
+        if not parsed.hostname:
+            return "URL has no host"
+        if not bool(self._cfg("block_private_urls", True)):
+            return None
+        try:
+            infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        except socket.gaierror as e:
+            return f"Could not resolve host: {e}"
+        for info in infos:
+            ip = info[4][0]
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                return f"Blocked request to unparseable address ({ip})"
+            if (addr.is_private or addr.is_loopback or addr.is_link_local
+                    or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+                return f"Blocked request to internal/reserved address ({ip})"
+        return None
+
+    async def _fetch_url(self, url: str, max_bytes: int) -> Tuple[Optional[bytes], Optional[str]]:
+        """Fetch a remote document with SSRF protection, re-validating each redirect hop.
+
+        Kept inline (rather than importing url_fetcher) to preserve the
+        self-contained-tool convention.
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            return None, "aiohttp not available; cannot fetch remote URL"
+
+        from urllib.parse import urljoin
+
+        err = self._host_ok(url)
+        if err:
+            return None, err
+
+        max_redirects = int(self._cfg("url_max_redirects", 5) or 0)
+        limit = max_bytes or 0
+        current = url
+        try:
+            timeout = aiohttp.ClientTimeout(total=int(self._cfg("url_timeout", 30) or 30))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for _ in range(max_redirects + 1):
+                    async with session.get(
+                        current, headers={"User-Agent": "file-extraction-service/1.0"}, allow_redirects=False
+                    ) as resp:
+                        if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                            nxt = urljoin(current, resp.headers["Location"])
+                            err = self._host_ok(nxt)
+                            if err:
+                                return None, f"Blocked redirect: {err}"
+                            current = nxt
+                            continue
+                        if resp.status >= 400:
+                            return None, f"Upstream returned HTTP {resp.status}"
+                        chunks, total = [], 0
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if limit and total > limit:
+                                return None, f"Remote file exceeds size limit of {limit} bytes"
+                            chunks.append(chunk)
+                        return b"".join(chunks), None
+            return None, f"Too many redirects (>{max_redirects})"
+        except Exception as e:  # noqa: BLE001
+            return None, f"Failed to fetch URL: {e}"
+
+    # ---------------------------------------------------------------- cache
+
+    def _cache_key(self, filename: str, content: bytes, kwargs: Dict[str, Any]) -> str:
+        h = hashlib.sha256()
+        h.update(content)
+        h.update(Path(filename).suffix.lower().encode())
+        h.update(str(kwargs.get("chunk_size") or 0).encode())
+        h.update(str(kwargs.get("chunk_overlap") or 0).encode())
+        return h.hexdigest()
+
+    def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        if not self._cfg("cache_enabled", True):
+            return None
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def _cache_put(self, key: str, value: Dict[str, Any]) -> None:
+        if not self._cfg("cache_enabled", True):
+            return
+        max_entries = int(self._cfg("cache_max_entries", 128) or 0)
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        while max_entries and len(self._cache) > max_entries:
+            self._cache.popitem(last=False)
+
+    # ------------------------------------------------------------------ OCR
+
+    async def _ocr_pdf(self, pdf_content: bytes, vision_stats: Dict[str, Any]):
+        """OCR a PDF page by page. Returns (markdown, pages, page_count, processed, truncated, method)."""
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            self._log("error", "PyMuPDF not available - cannot OCR scanned PDF")
+            return "", [], None, None, False, "none"
+
+        zoom = float(self._cfg("ocr_zoom", 2.0) or 2.0)
+        max_pages_cfg = int(self._cfg("ocr_max_pages", 50) or 0)
+
+        pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
+        try:
+            page_count = pdf_doc.page_count
+            limit = page_count if max_pages_cfg <= 0 else min(max_pages_cfg, page_count)
+            truncated = limit < page_count
+
+            pages: List[Dict[str, Any]] = []
+            parts: List[str] = []
+            used_vision = False
+            for page_num in range(limit):
+                page = pdf_doc[page_num]
+                pix = await asyncio.to_thread(page.get_pixmap, matrix=fitz.Matrix(zoom, zoom))
+                img_data = pix.tobytes("png")
+                text, method = await self._ocr_image(img_data, page_num + 1, vision_stats)
+                if method in ("vision", "ocr+vision"):
+                    used_vision = True
+                if text.strip():
+                    parts.append(f"# Page {page_num + 1}\n\n{text.strip()}\n")
+                    pages.append({"page": page_num + 1, "text": text.strip(), "method": method})
+                else:
+                    self._log("warning", f"No text extracted from page {page_num + 1}")
+        finally:
+            pdf_doc.close()
+
+        overall = "ocr+vision" if used_vision else "ocr"
+        return "\n".join(parts), pages, page_count, limit, truncated, overall
+
+    async def _ocr_image(self, img_data: bytes, page_num: int, vision_stats: Dict[str, Any]) -> Tuple[str, str]:
+        """Extract text from a single image. Level 1 traditional OCR, level 2 vision."""
+        ocr_text = await self._traditional_ocr(img_data, page_num)
+        if len(ocr_text.strip()) > 50:
+            return ocr_text.strip(), "ocr"
+
+        # Level 2: LLM vision, only if a client is configured and under the per-request cap.
+        vision_text = ""
+        if self.llm_client:
+            max_calls = int(self._cfg("vision_max_calls_per_request", 0) or 0)
+            if max_calls and vision_stats["calls"] >= max_calls:
+                vision_stats["capped"] = True
+            else:
+                vision_text = await self._vision_ocr(img_data, page_num, vision_stats)
+
+        # Level 3: pick the richer result.
+        if vision_text.strip() and ocr_text.strip():
+            if len(vision_text.strip()) > len(ocr_text.strip()):
+                return vision_text.strip(), "ocr+vision"
+            return ocr_text.strip(), "ocr+vision"
+        if vision_text.strip():
+            return vision_text.strip(), "vision"
+        return ocr_text.strip(), "ocr"
+
+    async def _traditional_ocr(self, img_data: bytes, page_num: int) -> str:
+        """pytesseract, falling back to easyocr. Runs off the event loop."""
+        lang = str(self._cfg("ocr_languages", "eng") or "eng")
+        try:
+            import pytesseract
+            from PIL import Image
+
+            def _run():
+                image = Image.open(io.BytesIO(img_data))
+                return pytesseract.image_to_string(image, lang=lang, config="--psm 6")
+
+            return await asyncio.to_thread(_run)
+        except ImportError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"pytesseract failed on page {page_num}: {e}")
+
+        try:
+            import numpy as np
+            from PIL import Image
+
+            def _run_easy():
+                reader = self._get_easyocr_reader(lang)
+                if reader is None:
+                    return ""
+                image = np.array(Image.open(io.BytesIO(img_data)))
+                results = reader.readtext(image)
+                return "\n".join(r[1] for r in results)
+
+            return await asyncio.to_thread(_run_easy)
+        except ImportError:
+            self._log("warning", "Neither pytesseract nor easyocr available for OCR")
+            return ""
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"easyocr failed on page {page_num}: {e}")
+            return ""
+
+    # Map common tesseract 3-letter codes to EasyOCR 2-letter codes.
+    _EASYOCR_LANG_MAP = {"eng": "en", "deu": "de", "fra": "fr", "spa": "es", "ita": "it", "por": "pt"}
+
+    def _get_easyocr_reader(self, lang: str):
+        """Construct the EasyOCR reader once and reuse it (model load is expensive)."""
+        if self._easyocr_reader is not None:
+            return self._easyocr_reader
+        try:
+            import easyocr
+
+            codes = []
+            for token in re.split(r"[+,\s]+", lang):
+                if not token:
+                    continue
+                codes.append(self._EASYOCR_LANG_MAP.get(token, token[:2]))
+            self._easyocr_reader = easyocr.Reader(codes or ["en"])
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"Failed to initialize EasyOCR: {e}")
+            self._easyocr_reader = None
+        return self._easyocr_reader
+
+    async def _vision_ocr(self, img_data: bytes, page_num: int, vision_stats: Dict[str, Any]) -> str:
+        """Extract text via an LLM vision model. Runs off the event loop."""
+        try:
+            img_b64 = base64.b64encode(img_data).decode()
+            model = self._cfg("openai_model", "gpt-4o")
+            max_tokens = int(self._cfg("vision_max_tokens", 4000) or 4000)
+
+            def _run():
+                return self.llm_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Extract all text from this image. Return only the text "
+                                            "content, preserving reading order and structure.",
+                                },
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                            ],
+                        }
+                    ],
+                    max_tokens=max_tokens,
+                )
+
+            response = await asyncio.to_thread(_run)
+            self._account_vision(response, model, vision_stats)
+            choice = response.choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                self._log("warning", f"Vision output truncated at {max_tokens} tokens on page {page_num}")
+            return choice.message.content or ""
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"Vision OCR failed on page {page_num}: {e}")
+            return ""
+
+    @staticmethod
+    def _account_vision(response, model: str, vision_stats: Dict[str, Any]) -> None:
+        """Update per-request vision usage/cost from an OpenAI response."""
+        usage = getattr(response, "usage", None)
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        in_price, out_price = VISION_PRICING.get(model, DEFAULT_VISION_PRICING)
+        vision_stats["calls"] += 1
+        vision_stats["prompt_tokens"] += prompt
+        vision_stats["completion_tokens"] += completion
+        vision_stats["cost_usd"] += (prompt / 1_000_000) * in_price + (completion / 1_000_000) * out_price
+
+    def _record_vision_metrics(self, vision_stats: Dict[str, Any]) -> None:
+        """Push per-request vision usage into the global metrics collector."""
+        if not self.tool_base or not vision_stats.get("calls"):
+            return
+        self.tool_base.record_metric("vision.calls", vision_stats["calls"])
+        self.tool_base.record_metric("vision.prompt_tokens", vision_stats["prompt_tokens"])
+        self.tool_base.record_metric("vision.completion_tokens", vision_stats["completion_tokens"])
+        self.tool_base.record_metric("vision.cost_usd", vision_stats["cost_usd"])
 
 
 def setup_tool(tool_base):
