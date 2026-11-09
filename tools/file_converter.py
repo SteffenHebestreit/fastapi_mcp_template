@@ -5,11 +5,18 @@ Converts various file formats (PDF, Office docs, images, HTML, ...) to
 LLM-ready Markdown using the MarkItDown library, with an OCR fallback for
 scanned PDFs and image files.
 
-Extraction pipeline for scanned/image content (three levels):
-  1. Traditional OCR (pytesseract, then easyocr) — fast, free, no LLM needed.
-  2. LLM vision analysis — used only when an OpenAI-compatible client is
-     configured and level 1 yields too little text.
-  3. Combination — pick the richer of the two per page.
+Extraction pipeline for scanned/image content. Two engines are available:
+  * Traditional OCR (pytesseract, then easyocr) — fast, free, no LLM needed.
+  * LLM vision — an OpenAI-compatible vision model reads the page image; the
+    best quality for handwriting, tables, poor scans and complex layouts.
+
+Which one reads a page first is set by ``ocr_strategy``:
+  * ``vision_first`` (default): the vision model, when the LLM integration is
+    enabled; traditional OCR is the fallback if the model returns nothing,
+    fails, or the per-request vision-call cap is reached.
+  * ``ocr_first``: traditional OCR; the vision model is only asked for pages
+    where OCR yields too little text, and the richer of the two results wins.
+Without an LLM, traditional OCR is used either way.
 
 The tool is self-contained (no imports from the core service) and reads its
 configuration from ``tool_base.config``.
@@ -17,6 +24,7 @@ configuration from ``tool_base.config``.
 
 import io
 import re
+import errno
 import base64
 import socket
 import asyncio
@@ -92,6 +100,61 @@ class ToolInterface:
         raise NotImplementedError
 
 
+def is_blocked_address(ip_str: str) -> bool:
+    """True for any address that is not a public, globally routable unicast address.
+
+    Covers loopback, private, link-local (cloud metadata), carrier-grade NAT
+    (100.64.0.0/10, also used by overlay VPNs), multicast and reserved ranges,
+    including IPv6 addresses that merely wrap such an IPv4 address.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    if ip.version == 6:
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if embedded is not None:
+            ip = embedded
+    return (
+        not ip.is_global
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified
+    )
+
+
+def make_guarded_resolver(aiohttp):
+    """A DNS resolver for aiohttp that refuses names resolving to internal addresses.
+
+    Validating a URL before the request is not enough on its own: the HTTP
+    client resolves the host name again when it connects, and a hostile DNS
+    server can answer the two lookups differently (DNS rebinding). Checking
+    inside the resolver validates the very addresses the connection will use.
+    """
+    from aiohttp.abc import AbstractResolver
+
+    class GuardedResolver(AbstractResolver):
+        def __init__(self):
+            self._inner = aiohttp.ThreadedResolver()
+
+        async def resolve(self, host, port=0, family=socket.AF_INET):
+            results = await self._inner.resolve(host, port, family)
+            for result in results:
+                if is_blocked_address(result["host"]):
+                    raise OSError(
+                        errno.EACCES,
+                        f"Blocked request to internal/reserved address ({result['host']})",
+                    )
+            return results
+
+        async def close(self):
+            await self._inner.close()
+
+    return GuardedResolver()
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (~4 chars/token) without pulling in a tokenizer dep."""
     if not text:
@@ -165,13 +228,16 @@ class FileToMarkdownConverter(ToolInterface):
         """Initialize MarkItDown, wiring an OpenAI client only if configured."""
         enable_llm = self._cfg("markitdown_enable_llm", False)
         api_key = self._cfg("openai_api_key")
+        base_url = self._cfg("openai_base_url")
 
-        if enable_llm and api_key:
+        # OpenAI itself needs a key. Self-hosted OpenAI-compatible servers
+        # (LM Studio, Ollama, vLLM, ...) are selected by base_url and usually
+        # need none, but the client refuses to start without some value.
+        if enable_llm and (api_key or base_url):
             try:
                 from openai import OpenAI
 
-                client_kwargs = {"api_key": api_key}
-                base_url = self._cfg("openai_base_url")
+                client_kwargs = {"api_key": api_key or "not-needed"}
                 if base_url:
                     client_kwargs["base_url"] = base_url
                 self.llm_client = OpenAI(**client_kwargs)
@@ -180,11 +246,22 @@ class FileToMarkdownConverter(ToolInterface):
                     llm_model=self._cfg("openai_model", "gpt-4o"),
                     enable_plugins=True,
                 )
-                self._log("info", "MarkItDown initialized with LLM vision support")
+                self._log(
+                    "info",
+                    f"MarkItDown initialized with LLM vision support "
+                    f"(model {self._cfg('openai_model', 'gpt-4o')}, "
+                    f"scanned pages: {'vision first' if self._vision_first() else 'OCR first'})",
+                )
                 return
             except Exception as e:  # noqa: BLE001 - fall back to basic mode
                 self.llm_client = None
                 self._log("warning", f"LLM setup failed, using basic MarkItDown: {e}")
+        elif enable_llm:
+            self._log(
+                "warning",
+                "LLM features are enabled but neither FTMD_OPENAI_API_KEY nor "
+                "FTMD_OPENAI_BASE_URL is set; continuing without LLM",
+            )
 
         self.markitdown = MarkItDown(enable_plugins=False)
 
@@ -196,9 +273,10 @@ class FileToMarkdownConverter(ToolInterface):
             description=(
                 "Extract text from a file (PDF, DOCX, XLSX, PPTX, images, HTML, ...) as "
                 "LLM-ready Markdown. Provide the file as base64 via 'base64_content' (for "
-                "MCP/JSON clients) or as a multipart upload via the REST endpoint. Scanned "
-                "PDFs and images fall back to OCR automatically. Returns markdown plus "
-                "per-page text, a token estimate, and optional chunks."
+                "MCP/JSON clients), as a 'url' to fetch, or as a multipart upload via the "
+                "REST endpoint. Scanned PDFs and images are read by OCR / a vision model "
+                "automatically. Returns markdown plus per-page text, a token estimate, "
+                "and optional chunks."
             ),
             endpoint="/convert",
             tool_type="converter",
@@ -475,12 +553,7 @@ class FileToMarkdownConverter(ToolInterface):
             return f"Could not resolve host: {e}"
         for info in infos:
             ip = info[4][0]
-            try:
-                addr = ipaddress.ip_address(ip)
-            except ValueError:
-                return f"Blocked request to unparseable address ({ip})"
-            if (addr.is_private or addr.is_loopback or addr.is_link_local
-                    or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            if is_blocked_address(ip):
                 return f"Blocked request to internal/reserved address ({ip})"
         return None
 
@@ -506,7 +579,11 @@ class FileToMarkdownConverter(ToolInterface):
         current = url
         try:
             timeout = aiohttp.ClientTimeout(total=int(self._cfg("url_timeout", 30) or 30))
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            connector = None
+            if bool(self._cfg("block_private_urls", True)):
+                # Re-checks the addresses at connect time (DNS rebinding).
+                connector = aiohttp.TCPConnector(resolver=make_guarded_resolver(aiohttp))
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 for _ in range(max_redirects + 1):
                     async with session.get(
                         current, headers={"User-Agent": "file-extraction-service/1.0"}, allow_redirects=False
@@ -563,10 +640,13 @@ class FileToMarkdownConverter(ToolInterface):
     async def _ocr_pdf(self, pdf_content: bytes, vision_stats: Dict[str, Any]):
         """OCR a PDF page by page. Returns (markdown, pages, page_count, processed, truncated, method)."""
         try:
-            import fitz  # PyMuPDF
+            import pymupdf as fitz  # PyMuPDF >= 1.24.3
         except ImportError:
-            self._log("error", "PyMuPDF not available - cannot OCR scanned PDF")
-            return "", [], None, None, False, "none"
+            try:
+                import fitz  # the module name in older PyMuPDF releases
+            except ImportError:
+                self._log("error", "PyMuPDF not available - cannot OCR scanned PDF")
+                return "", [], None, None, False, "none"
 
         zoom = float(self._cfg("ocr_zoom", 2.0) or 2.0)
         max_pages_cfg = int(self._cfg("ocr_max_pages", 50) or 0)
@@ -579,15 +659,14 @@ class FileToMarkdownConverter(ToolInterface):
 
             pages: List[Dict[str, Any]] = []
             parts: List[str] = []
-            used_vision = False
+            methods = set()
             for page_num in range(limit):
                 page = pdf_doc[page_num]
                 pix = await asyncio.to_thread(page.get_pixmap, matrix=fitz.Matrix(zoom, zoom))
                 img_data = pix.tobytes("png")
                 text, method = await self._ocr_image(img_data, page_num + 1, vision_stats)
-                if method in ("vision", "ocr+vision"):
-                    used_vision = True
                 if text.strip():
+                    methods.add(method)
                     parts.append(f"# Page {page_num + 1}\n\n{text.strip()}\n")
                     pages.append({"page": page_num + 1, "text": text.strip(), "method": method})
                 else:
@@ -595,25 +674,46 @@ class FileToMarkdownConverter(ToolInterface):
         finally:
             pdf_doc.close()
 
-        overall = "ocr+vision" if used_vision else "ocr"
+        # "vision" / "ocr" when every page was read by one engine, else "ocr+vision".
+        overall = methods.pop() if len(methods) == 1 else ("ocr+vision" if methods else "ocr")
         return "\n".join(parts), pages, page_count, limit, truncated, overall
 
+    def _vision_first(self) -> bool:
+        """Whether scanned pages go to the vision LLM before traditional OCR."""
+        strategy = str(self._cfg("ocr_strategy", "vision_first") or "vision_first").strip().lower()
+        return bool(self.llm_client) and strategy != "ocr_first"
+
+    async def _vision_within_cap(self, img_data: bytes, page_num: int, vision_stats: Dict[str, Any]) -> str:
+        """Run vision OCR unless the per-request vision-call cap is exhausted."""
+        max_calls = int(self._cfg("vision_max_calls_per_request", 0) or 0)
+        if max_calls and vision_stats["calls"] >= max_calls:
+            vision_stats["capped"] = True
+            return ""
+        return await self._vision_ocr(img_data, page_num, vision_stats)
+
     async def _ocr_image(self, img_data: bytes, page_num: int, vision_stats: Dict[str, Any]) -> Tuple[str, str]:
-        """Extract text from a single image. Level 1 traditional OCR, level 2 vision."""
+        """Extract text from a single page image. Returns (text, method).
+
+        See the module docstring for the two strategies.
+        """
+        if self._vision_first():
+            vision_text = (await self._vision_within_cap(img_data, page_num, vision_stats)).strip()
+            if vision_text:
+                return vision_text, "vision"
+            # The model returned nothing, failed, or the cap was reached.
+            return (await self._traditional_ocr(img_data, page_num)).strip(), "ocr"
+
+        # ocr_first (or no LLM configured): traditional OCR reads the page.
         ocr_text = await self._traditional_ocr(img_data, page_num)
         if len(ocr_text.strip()) > 50:
             return ocr_text.strip(), "ocr"
 
-        # Level 2: LLM vision, only if a client is configured and under the per-request cap.
+        # Too little text: ask the vision model, if there is one.
         vision_text = ""
         if self.llm_client:
-            max_calls = int(self._cfg("vision_max_calls_per_request", 0) or 0)
-            if max_calls and vision_stats["calls"] >= max_calls:
-                vision_stats["capped"] = True
-            else:
-                vision_text = await self._vision_ocr(img_data, page_num, vision_stats)
+            vision_text = await self._vision_within_cap(img_data, page_num, vision_stats)
 
-        # Level 3: pick the richer result.
+        # Pick the richer result.
         if vision_text.strip() and ocr_text.strip():
             if len(vision_text.strip()) > len(ocr_text.strip()):
                 return vision_text.strip(), "ocr+vision"

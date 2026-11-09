@@ -126,8 +126,12 @@ class ToolManager:
         if missing:
             raise ValueError(f"Missing required argument(s) for '{tool_name}': {', '.join(missing)}")
 
-    async def execute_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
-        """Execute a registered tool."""
+    async def execute_tool(self, tool_name: str, /, **kwargs) -> Dict[str, Any]:
+        """Execute a registered tool.
+
+        ``tool_name`` is positional-only so a tool argument that happens to be
+        called "tool_name" is passed through instead of clashing with it.
+        """
         if tool_name not in self.registered_tools:
             raise ValueError(f"Tool '{tool_name}' not found")
 

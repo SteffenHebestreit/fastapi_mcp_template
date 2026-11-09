@@ -9,6 +9,7 @@ including the cloud metadata endpoint (169.254.169.254).
 Self-contained: no imports from the core service.
 """
 
+import errno
 import socket
 import ipaddress
 from typing import Dict, Any, List, Optional, Tuple
@@ -73,18 +74,58 @@ class ToolInterface:
 
 
 def _ip_is_blocked(ip_str: str) -> bool:
+    """True for any address that is not a public, globally routable unicast address.
+
+    Covers loopback, private, link-local (cloud metadata), carrier-grade NAT
+    (100.64.0.0/10, also used by overlay VPNs), multicast and reserved ranges,
+    including IPv6 addresses that merely wrap such an IPv4 address.
+    """
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True
+    if ip.version == 6:
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if embedded is not None:
+            ip = embedded
     return (
-        ip.is_private
+        not ip.is_global
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_reserved
         or ip.is_multicast
         or ip.is_unspecified
     )
+
+
+def make_guarded_resolver():
+    """A DNS resolver for aiohttp that refuses names resolving to internal addresses.
+
+    validate_url() checks a URL before the request, but the HTTP client resolves
+    the host name again when it connects, and a hostile DNS server can answer
+    the two lookups differently (DNS rebinding). Checking inside the resolver
+    validates the very addresses the connection will use.
+    """
+    from aiohttp.abc import AbstractResolver
+
+    class GuardedResolver(AbstractResolver):
+        def __init__(self):
+            self._inner = aiohttp.ThreadedResolver()
+
+        async def resolve(self, host, port=0, family=socket.AF_INET):
+            results = await self._inner.resolve(host, port, family)
+            for result in results:
+                if _ip_is_blocked(result["host"]):
+                    raise OSError(
+                        errno.EACCES,
+                        f"Blocked request to internal/reserved address ({result['host']})",
+                    )
+            return results
+
+        async def close(self):
+            await self._inner.close()
+
+    return GuardedResolver()
 
 
 def validate_url(url: str, block_private: bool) -> Tuple[bool, Optional[str]]:
@@ -222,7 +263,9 @@ class URLFetcher(ToolInterface):
         timeout_obj = aiohttp.ClientTimeout(total=timeout)
         headers = {"User-Agent": user_agent}
         current = url
-        async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+        # Re-checks the addresses at connect time (DNS rebinding).
+        connector = aiohttp.TCPConnector(resolver=make_guarded_resolver()) if block_private else None
+        async with aiohttp.ClientSession(timeout=timeout_obj, connector=connector) as session:
             for _ in range(max_redirects + 1):
                 async with session.get(current, headers=headers, allow_redirects=False) as resp:
                     if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):

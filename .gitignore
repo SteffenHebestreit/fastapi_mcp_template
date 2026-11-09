@@ -167,9 +167,6 @@ dmypy.json
 data/
 !data/.gitkeep
 
-# Docker
-.dockerignore
-
 # Temporary files
 *.tmp
 *.temp

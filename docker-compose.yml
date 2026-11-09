@@ -23,11 +23,19 @@ services:
       # Security: set an API key to require X-API-Key on tool/admin endpoints.
       FTMD_API_KEY: ${FTMD_API_KEY:-}
       FTMD_CORS_ORIGINS: ${FTMD_CORS_ORIGINS:-*}
-      # Optional LLM vision OCR for scanned docs (traditional OCR works without this).
+      # Optional LLM vision for scanned docs (traditional OCR works without this).
+      # FTMD_OPENAI_API_KEY may stay empty for a self-hosted endpoint (FTMD_OPENAI_BASE_URL).
       FTMD_MARKITDOWN_ENABLE_LLM: ${FTMD_MARKITDOWN_ENABLE_LLM:-false}
       FTMD_OPENAI_API_KEY: ${FTMD_OPENAI_API_KEY:-}
       FTMD_OPENAI_MODEL: ${FTMD_OPENAI_MODEL:-gpt-4o}
       FTMD_OPENAI_BASE_URL: ${FTMD_OPENAI_BASE_URL:-}
+      # Scanned pages: vision_first (LLM reads them, Tesseract is the fallback)
+      # or ocr_first (Tesseract reads them, LLM only for pages it cannot read).
+      FTMD_OCR_STRATEGY: ${FTMD_OCR_STRATEGY:-vision_first}
+      FTMD_OCR_LANGUAGES: ${FTMD_OCR_LANGUAGES:-eng}
+      FTMD_OCR_MAX_PAGES: ${FTMD_OCR_MAX_PAGES:-50}
+      FTMD_VISION_MAX_TOKENS: ${FTMD_VISION_MAX_TOKENS:-4000}
+      FTMD_VISION_MAX_CALLS_PER_REQUEST: ${FTMD_VISION_MAX_CALLS_PER_REQUEST:-0}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -62,6 +70,11 @@ services:
       FTMD_OPENAI_API_KEY: ${FTMD_OPENAI_API_KEY:-}
       FTMD_OPENAI_MODEL: ${FTMD_OPENAI_MODEL:-gpt-4o}
       FTMD_OPENAI_BASE_URL: ${FTMD_OPENAI_BASE_URL:-}
+      FTMD_OCR_STRATEGY: ${FTMD_OCR_STRATEGY:-vision_first}
+      FTMD_OCR_LANGUAGES: ${FTMD_OCR_LANGUAGES:-eng}
+      FTMD_OCR_MAX_PAGES: ${FTMD_OCR_MAX_PAGES:-50}
+      FTMD_VISION_MAX_TOKENS: ${FTMD_VISION_MAX_TOKENS:-4000}
+      FTMD_VISION_MAX_CALLS_PER_REQUEST: ${FTMD_VISION_MAX_CALLS_PER_REQUEST:-0}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]

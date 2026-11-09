@@ -2,4 +2,6 @@
 #
 # SPDX-License-Identifier: MIT
 
-__version__ = "0.1.0"
+# Single source of truth for the version shown in the API docs and reported to
+# MCP clients (serverInfo.version).
+__version__ = "1.1.0"

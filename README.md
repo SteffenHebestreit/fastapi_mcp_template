@@ -13,7 +13,7 @@ exposed over both interfaces), so you can extend it with your own extractors.
 ### What it does
 
 - **File → Markdown** via the [MarkItDown](https://github.com/microsoft/markitdown) library: PDF, DOCX, XLSX, PPTX, HTML, images, and more.
-- **OCR fallback for scanned PDFs and images** — traditional OCR (Tesseract) runs first and needs **no API key**; an optional LLM vision model is a second-level fallback for hard pages.
+- **Scanned PDFs and images** — read by an LLM vision model when one is configured (best quality), with traditional OCR (Tesseract) as the fallback. Without an LLM, Tesseract does the job and needs **no API key**. The order is configurable.
 - **LLM-ready structured output** — Markdown plus per-page text, a token estimate, an extraction-method label, and optional character-based chunks with overlap.
 - **URL ingestion** — fetch a web page as Markdown, or fetch a remote document and extract it, with protection against requests to internal/private addresses (SSRF).
 - **Caching** — identical files are extracted once and served from a content-hash cache (no repeated OCR / vision cost).
@@ -41,15 +41,19 @@ fastapi-mcp-template/
 │   ├── config.py                 # Configuration management
 │   ├── main.py                   # Application entry point
 │   ├── requirements.txt          # Core dependencies only
-│   ├── api/                      # REST API endpoints
+│   ├── api/                      # HTTP layer
 │   │   ├── __init__.py
-│   │   └── routes.py             # API route definitions
+│   │   ├── routes.py             # MCP endpoint, REST API and job routes
+│   │   └── security.py           # Origin allow-list and request size limit
 │   ├── core/                     # MCP core functionality
 │   │   ├── __init__.py
+│   │   ├── jobs.py               # In-process background jobs
+│   │   ├── metrics.py            # In-process metrics counters
+│   │   ├── session_store.py      # MCP sessions (idle expiry, size cap)
 │   │   ├── tool_base.py          # Base tool infrastructure
 │   │   ├── tool_definition.py    # Tool interface definitions
 │   │   └── tool_manager.py       # Dynamic tool loading
-│   └── core_test/                # Core functionality tests
+│   └── core_test/                # Core functionality tests + in-app test runner
 │       ├── __init__.py
 │       ├── requirements.txt      # Test dependencies
 │       ├── test_base.py
@@ -63,12 +67,16 @@ fastapi-mcp-template/
 │       ├── file_converter.txt    # Dependencies for file_converter (markitdown, openai, PyMuPDF)
 │       ├── text_processor.txt    # Dependencies for text_processor
 │       └── url_fetcher.txt       # Dependencies for url_fetcher
-├── tests/                        # Tool tests
+├── tests/
 │   ├── __init__.py
-│   └── test_tools.py
+│   ├── test_api.py               # REST API, jobs, metrics
+│   ├── test_mcp_http.py          # MCP protocol, sessions, CORS, API key, limits
+│   ├── test_ocr_and_ssrf.py      # OCR engine selection, SSRF guard
+│   └── test_tools.py             # Tool behaviour (extraction, chunking, caching)
 ├── data/                         # Data directory for file storage
 ├── docker-compose.yml            # Container orchestration
 ├── Dockerfile                    # Container definition with dynamic deps
+├── pytest.ini                    # Test configuration
 ├── .env.example                  # Environment configuration template
 └── README.md                     # This file
 ```
@@ -89,7 +97,7 @@ fastapi-mcp-template/
 - **Interactive Documentation**: Auto-generated API docs at `/docs`
 
 ### **Production-Ready Deployment**
-- **Docker Support**: Complete containerization with multi-stage builds
+- **Docker Support**: Complete containerization with cache-friendly image layers
 - **Dynamic Dependencies**: Tool dependencies installed only when tools are enabled
 - **Health Checks**: Built-in monitoring and health endpoints
 - **Environment Configuration**: Flexible configuration through environment variables
@@ -100,177 +108,82 @@ fastapi-mcp-template/
 - **Error Handling**: Comprehensive error handling and logging
 - **Testing Ready**: Structure supports easy unit and integration testing
 
-## 📋 MCP Protocol Compliance
+## 📋 MCP Protocol Support
 
-This template implements the **Model Context Protocol (MCP) 2024-11-05** specification with full compliance to ensure seamless integration with MCP clients like Claude Desktop, Cline, and other LLM applications.
+The `/mcp` endpoint implements the **tools** part of the Model Context Protocol over a
+single HTTP endpoint (Streamable HTTP with JSON responses).
 
-### **Protocol Standards Adherence**
+| | |
+|---|---|
+| Protocol revisions | `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`. The client's requested revision is echoed when supported; otherwise the newest one is offered. |
+| Methods | `initialize`, `notifications/*`, `tools/list`, `tools/call`, `ping` |
+| JSON-RPC | Single messages and batches. Notifications are answered with `202` and no body. |
+| Capabilities | `tools` with `listChanged: false` — there is no server→client stream to announce changes on. |
+| Not implemented | The stateless `2026-07-28` revision (`server/discover`), SSE streams (`GET /mcp` returns `405`), resources, prompts, OAuth. |
 
-#### **JSON-RPC 2.0 Foundation**
-- ✅ **Full JSON-RPC 2.0 compliance** with proper message structure
-- ✅ **Unique request IDs** that are never reused within a session
-- ✅ **Proper error codes** following JSON-RPC standards (-32000 to -32099 range)
-- ✅ **Structured error responses** with code, message, and optional data fields
+Clients that prefer the stateless 2026-07-28 revision — the current official SDKs in
+their default mode — probe with `server/discover`, are rejected, and fall back to the
+`initialize` handshake, which works.
 
-#### **MCP Lifecycle Management**
-- ✅ **Proper initialization handshake** with capability negotiation
-- ✅ **Session management** with UUID-based session IDs
-- ✅ **Protocol version negotiation** (supports 2024-11-05)
-- ✅ **Graceful error handling** for unsupported protocol versions
+### Sessions
 
-#### **Core MCP Methods**
-```json
-{
-  "initialize": "✅ Capability negotiation with tool listing support",
-  "notifications/initialized": "✅ Post-initialization state management", 
-  "tools/list": "✅ Dynamic tool discovery and enumeration",
-  "tools/call": "✅ Tool execution with parameter validation",
-  "ping": "✅ Connection liveness verification"
-}
-```
+`initialize` returns a session ID in the `Mcp-Session-Id` response header; the client
+sends it back on every later request.
 
-### **Capability Declaration**
+- A session expires after `FTMD_SESSION_TTL_SECONDS` **without a request** (default 1 hour). A session in regular use does not expire.
+- A request without the header gets HTTP `400`; an unknown or expired session gets HTTP `404`. On `404` MCP clients start a new session by themselves — this is also what happens after a server restart, because sessions are kept in memory.
+- `DELETE /mcp` with the session header ends a session.
+- At most `FTMD_MAX_SESSIONS` sessions are kept (least recently used are dropped first).
 
-The server correctly declares its capabilities during initialization:
+A session ID is not a credential. To restrict access, set `FTMD_API_KEY`.
 
-```json
-{
-  "capabilities": {
-    "tools": {
-      "listChanged": true
-    }
-  },  
-  "serverInfo": {
-    "name": "fastapi_mcp_template",
-    "version": "1.0.0"
-  }
-}
-```
+### Tool results
 
-**Key Compliance Features:**
-- **Tool Capability**: Declares support for tool listing and execution
-- **Dynamic Updates**: Supports `listChanged` notifications for tool modifications
-- **Server Identity**: Proper server information with name and version
-- **Protocol Version**: Explicit protocol version support declaration
-
-### **Tool Schema Compliance**
-
-Tools follow MCP tool specification with proper JSON Schema validation:
-
-```json
-{
-  "name": "file_to_markdown",
-  "description": "Convert files to Markdown format",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Name of the file to convert"
-      },
-      "base64_content": {
-        "type": "string", 
-        "description": "Base64 encoded file content"
-      }
-    },
-    "required": ["filename", "base64_content"]
-  }
-}
-```
-
-### **Error Handling Standards**
-
-#### **Protocol-Level Errors**
-- **-32601**: Method not found (unsupported MCP methods)
-- **-32602**: Invalid params (malformed requests, unknown tools)
-- **-32603**: Internal error (server-side failures)
-- **-32002**: Server not initialized (session/capability issues)
-
-#### **Tool Execution Errors**
-Tool errors are reported within successful JSON-RPC responses using the `isError` flag:
+A tool's return value is delivered as one text content block containing **JSON**
+(UTF-8, non-ASCII characters are not escaped). `isError` is `true` when the tool
+raised an exception **or** returned `{"success": false, ...}`:
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 123,
+  "id": 3,
   "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "Tool execution failed: File format not supported"
-      }
-    ],
+    "content": [{"type": "text", "text": "{\"success\": false, \"error\": \"No text could be extracted\", ...}"}],
     "isError": true
   }
 }
 ```
 
-### **Session Management**
+Missing required arguments are reported the same way, so the model can correct its call.
 
-#### **Session Lifecycle**
-1. **Initialization**: Client sends `initialize` request
-2. **Capability Negotiation**: Server responds with supported features
-3. **Ready State**: Client sends `notifications/initialized`
-4. **Active Session**: Tools can be listed and called
-5. **Session Persistence**: Sessions maintain state across requests
+### Errors
 
-#### **Session Security**
-- **UUID-based Session IDs**: Cryptographically secure session identifiers
-- **Session Validation**: All requests validated against active sessions
-- **Session Timeout**: Automatic cleanup of inactive sessions
-- **Header-based Authentication**: Session ID passed via `Mcp-Session-Id` header
+| Code | HTTP | Meaning |
+|---|---|---|
+| `-32700` | 400 | Body is not valid JSON |
+| `-32600` | 200 / 400 | Not a JSON-RPC 2.0 message; unsupported `MCP-Protocol-Version` header (400) |
+| `-32601` | 200 | Unknown method |
+| `-32602` | 200 | Malformed `tools/call` params, or unknown tool |
+| `-32603` | 200 | Internal error |
+| `-32001` | 200 | API key required (`FTMD_API_KEY` is set) and missing or wrong |
+| `-32002` | 400 / 404 | No session header (400), unknown or expired session (404) |
 
-### **Transport Layer Compliance**
+### Browser clients
 
-#### **HTTP Transport Support**
-- ✅ **Content-Type**: `application/json` for all requests/responses
-- ✅ **CORS Support**: Proper cross-origin headers for web clients
-- ✅ **Session Headers**: `Mcp-Session-Id` header handling
-- ✅ **Status Codes**: Appropriate HTTP status codes (200, 202, 400, 500)
+CORS allows the headers MCP clients send (`Content-Type`, `Accept`, `Authorization`,
+`X-API-Key`, `Mcp-Session-Id`, `MCP-Protocol-Version`) and exposes `Mcp-Session-Id`.
+Set `FTMD_CORS_ORIGINS` to the origins of your web clients to reject every other
+browser origin (HTTP `403`).
 
-#### **Endpoint Structure**
-```bash
-POST /mcp                    # Main MCP protocol endpoint
-POST /                      # Fallback MCP endpoint
-GET  /mcp/session           # Session creation helper
-OPTIONS /mcp                # CORS preflight support
-```
-
-### **Testing & Validation**
-
-#### **MCP Inspector Compatibility**
-The server is fully compatible with the official MCP Inspector tool:
+### Trying it out
 
 ```bash
-# Test with MCP Inspector
 npx @modelcontextprotocol/inspector
-# Connect to: http://localhost:8000/mcp
+# Transport: "Streamable HTTP", URL: http://localhost:8000/mcp
 ```
 
-#### **Protocol Validation Tests**
-- ✅ **Initialization Flow**: Complete handshake sequence
-- ✅ **Tool Discovery**: List and validate all available tools
-- ✅ **Tool Execution**: Parameter validation and result formatting
-- ✅ **Error Scenarios**: Proper error code and message handling
-- ✅ **Session Management**: Session creation, validation, and cleanup
-
-### **Interoperability**
-
-#### **Client Compatibility**
-Tested and verified with:
-- ✅ **Claude Desktop**: Full integration support
-- ✅ **MCP Inspector**: Official testing tool compatibility
-- ✅ **Custom Clients**: Java, TypeScript, Python client libraries
-- ✅ **Web Clients**: Browser-based MCP applications
-
-#### **Standards Compliance**
-- 📋 **MCP Specification 2024-11-05**: Full compliance
-- 📋 **JSON-RPC 2.0**: Complete implementation
-- 📋 **JSON Schema**: Tool parameter validation
-- 📋 **HTTP/1.1**: Standard web compatibility
-- 📋 **CORS**: Cross-origin resource sharing support
-
-This comprehensive compliance ensures that any MCP client can seamlessly connect to and interact with your server, providing a reliable foundation for LLM integrations.
+The protocol behaviour is covered by `tests/test_mcp_http.py` and was checked end to end
+against the official MCP Python SDK client.
 
 ## 🛠️ Example Use Cases
 
@@ -356,12 +269,11 @@ pip install -r tools/requirements/url_fetcher.txt     # URL fetching
 # - Ubuntu/Debian: sudo apt install tesseract-ocr
 # - macOS: brew install tesseract
 
-# 6. Run the server (config comes from FTMD_* env vars / .env — no CLI flags)
-#    PYTHONPATH must include the repo root so the package is importable.
-PYTHONPATH=. python -m fastapi_mcp_template.main
+# 6. Run the server from the repo root (config comes from FTMD_* env vars / .env — no CLI flags)
+python fastapi_mcp_template/main.py
 
 # Custom configuration is via environment variables, e.g.:
-FTMD_PORT=8080 FTMD_DEBUG=true PYTHONPATH=. python -m fastapi_mcp_template.main
+FTMD_PORT=8080 FTMD_DEBUG=true python fastapi_mcp_template/main.py
 ```
 
 ## 🔧 Configuration
@@ -386,17 +298,26 @@ FTMD_ENABLED_TOOLS=file_converter,text_processor,url_fetcher  # empty = all
 # FTMD_TOOLS_DIRECTORY=/app/tools    # auto-detected; override only if needed
 
 # Security
-FTMD_API_KEY=                   # if set, X-API-Key required on tool/admin endpoints
-FTMD_CORS_ORIGINS=*             # "*" (no credentials) or comma-separated origins
+FTMD_API_KEY=                   # if set, required on tool/admin endpoints (X-API-Key or Bearer token)
+FTMD_CORS_ORIGINS=*             # "*" or comma-separated origins; a list also rejects other browser origins
+
+# MCP sessions
+FTMD_SESSION_TTL_SECONDS=3600   # idle time before a session expires (0 = never)
 
 # Extraction limits
-FTMD_MAX_UPLOAD_BYTES=52428800  # 50 MiB
+FTMD_MAX_UPLOAD_BYTES=52428800  # 50 MiB per file
+FTMD_MAX_REQUEST_BYTES=0        # largest request body; 0 = derived from the upload limit
 FTMD_OCR_MAX_PAGES=50           # 0 = no limit
-FTMD_OCR_LANGUAGES=eng          # tesseract lang(s), e.g. eng+deu
+FTMD_OCR_LANGUAGES=eng          # tesseract lang(s), e.g. deu+eng
+FTMD_OCR_STRATEGY=vision_first  # or ocr_first; see "How scanned pages are read"
 
 # URL fetching / SSRF
 FTMD_BLOCK_PRIVATE_URLS=true    # block internal/private/metadata addresses
 ```
+
+> With Docker Compose, a variable reaches the container only if it is listed under
+> `environment:` in `docker-compose.yml`. The LLM, OCR and security settings are passed
+> through from your `.env`; add a line there for anything else you want to change.
 
 ### OpenAI Integration Configuration
 
@@ -451,36 +372,48 @@ Common OpenAI models that work well with MarkItDown:
 - `gpt-4-turbo`
 - `gpt-4`
 
-#### Features Enhanced by LLM Integration
-When LLM integration is enabled, the file converter provides:
-1. **Enhanced Image Processing**: Generate detailed descriptions of images, charts, and diagrams
-2. **OCR for Scanned PDFs**: Automatically converts PDF pages to images and extracts text using vision-capable LLMs
-3. **Better Content Analysis**: Improved understanding of document structure and content
-4. **Smart Formatting**: More intelligent Markdown formatting decisions
+#### Self-hosted OpenAI-compatible servers
+For LM Studio, Ollama, vLLM and similar, set the endpoint and the model. No API key is needed:
 
-**Enhanced OCR Fallback Process:**
-The file converter now uses a sophisticated three-level fallback system for scanned PDFs:
+```bash
+FTMD_MARKITDOWN_ENABLE_LLM=true
+FTMD_OPENAI_BASE_URL=http://host.docker.internal:1234/v1   # the host machine, seen from the container
+FTMD_OPENAI_MODEL=your-vision-model
+```
 
-1. **Traditional OCR (Primary)**: Fast and cost-effective text extraction using pytesseract or easyocr
-   - Processes document images using traditional OCR algorithms
-   - Ideal for clear, standard fonts and simple layouts
-   - No API costs, works offline
+The model must accept images (a vision model).
 
-2. **LLM Vision Analysis (Secondary)**: Advanced analysis for complex content
-   - Used when traditional OCR yields insufficient results (<50 characters)
-   - Handles handwriting, complex layouts, and poor-quality scans
-   - Uses vision-capable LLMs for superior accuracy
+### How scanned pages are read
 
-3. **Intelligent Selection (Tertiary)**: Combines best results
-   - Automatically selects the most comprehensive output
-   - Prefers traditional OCR when sufficient, LLM when needed
-   - Optimizes for both cost and accuracy
+A PDF that yields no text, and every image file, is read page by page. Two engines exist:
 
-**Process Details:**
-- Automatically detects scanned PDFs (empty text content)
-- Converts PDF pages to high-resolution images (2x zoom)
-- Processes up to 5 pages per document to manage costs
-- Maintains original formatting and structure in Markdown output
+| Engine | Needs | Strengths |
+|---|---|---|
+| **LLM vision** | `FTMD_MARKITDOWN_ENABLE_LLM=true` and a vision model | Best quality: handwriting, tables, poor scans, complex layouts |
+| **Traditional OCR** (Tesseract) | Nothing — bundled in the Docker image | Free, fast, offline; good for clean printed text |
+
+`FTMD_OCR_STRATEGY` decides which one reads a page first:
+
+- **`vision_first`** (default): the vision model reads the page. Tesseract takes over for a page when the model returns nothing, the request fails, or the per-request cap (`FTMD_VISION_MAX_CALLS_PER_REQUEST`) is reached.
+- **`ocr_first`**: Tesseract reads the page. The vision model is only asked for pages where Tesseract finds 50 characters or fewer, and the richer of the two results is used. Choose this to keep paid API usage low.
+
+**Without the LLM integration, Tesseract is used either way — OCR needs no API key.**
+
+Related settings:
+
+- `FTMD_OCR_LANGUAGES` — Tesseract language codes joined with `+` (default `eng`). The Docker image ships `eng`, `deu`, `fra` and `spa`; add `tesseract-ocr-<lang>` packages to the Dockerfile for others. For German documents: `FTMD_OCR_LANGUAGES=deu+eng`.
+- `FTMD_OCR_MAX_PAGES` — pages read per document (default `50`, `0` = all). The response says so when pages were skipped (`metadata.truncated` and a warning).
+- `FTMD_VISION_MAX_TOKENS` — output limit per page for the vision model (default `4000`).
+
+The response tells you what happened: `metadata.extraction_method` is `markitdown`
+(text was embedded in the file), `vision`, `ocr`, or `ocr+vision` (both engines were
+used); `pages[]` lists the method per page; `metadata.vision` reports the number of
+vision calls, token usage and an estimated cost.
+
+**Cost:** with `vision_first`, every scanned page is one vision call. That is free with
+a self-hosted model. With a paid API, bound it with `FTMD_OCR_MAX_PAGES` /
+`FTMD_VISION_MAX_CALLS_PER_REQUEST`, or use `ocr_first`. Identical files are served
+from the cache and are not billed twice.
 
 ### Docker Configuration
 
@@ -492,9 +425,9 @@ The file converter now uses a sophisticated three-level fallback system for scan
 - Health checks
 
 **Dockerfile** features:
-- Multi-stage builds for optimization
+- Dependencies are installed before the source is copied, so code changes rebuild in seconds
 - Dynamic dependency installation based on enabled tools
-- Security-hardened container (non-root user)
+- Container runs as a non-root user
 - Health check endpoints
 
 ## 🎯 Adding Your Own Tools
@@ -650,6 +583,7 @@ Once running, the server provides multiple interfaces:
 
 ### MCP Protocol Endpoints
 - `POST /mcp` - Main MCP protocol endpoint (handles all MCP methods)
+- `DELETE /mcp` - End the session named in the `Mcp-Session-Id` header
 - `GET /mcp/session` - Session creation helper endpoint
 
 ### REST API Endpoints
@@ -679,14 +613,15 @@ curl http://localhost:8000/api/jobs/$JID
 
 ### MCP protocol notes
 
-The `/mcp` endpoint speaks JSON-RPC 2.0 and supports **batch requests** (send an
-array), negotiates `protocolVersion` (echoes the client's when supported: `2024-11-05`
-or `2025-03-26`), and declares `tools.listChanged: false` (there is no server→client
-push stream). `GET /mcp` returns `405` (SSE streaming is not implemented; use POST).
+See [MCP Protocol Support](#-mcp-protocol-support) for protocol revisions, sessions,
+error codes and CORS.
 
-> **Auth:** if `FTMD_API_KEY` is set, tool-execution and admin endpoints require an
-> `X-API-Key` header. If it is unset (default), auth is disabled — do not expose the
-> service publicly without setting a key.
+> **Auth:** if `FTMD_API_KEY` is set, tool-execution and admin endpoints require it,
+> sent as `X-API-Key: <key>` or `Authorization: Bearer <key>`. If it is unset (default),
+> auth is disabled — do not expose the service publicly without setting a key.
+>
+> **Request size:** bodies larger than `FTMD_MAX_REQUEST_BYTES` are rejected with `413`
+> (by default derived from `FTMD_MAX_UPLOAD_BYTES`).
 
 ### Available Tools
 - `file_to_markdown` - Extract files/URLs to Markdown with OCR fallback, chunking, and caching
@@ -786,10 +721,11 @@ curl -X POST http://localhost:8000/mcp \
 
 ```bash
 # Run with hot reloading
-python fastapi_mcp_template/main.py --reload
+FTMD_RELOAD=true FTMD_DEBUG=true python fastapi_mcp_template/main.py
 
-# Or with Docker in development mode
-docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+# Or with Docker: the dev profile mounts the source, reloads on change and
+# enables the test endpoints (published on port 8001)
+docker compose --profile dev up file-extraction-service-dev
 ```
 
 ### Testing the MCP Server
@@ -847,10 +783,10 @@ curl -X POST http://localhost:8000/mcp \
 
 #### Expected Behavior
 
-1. Initialize should return a session ID and server info
+1. Initialize should return a session ID (`Mcp-Session-Id` response header; add `-i` to curl to see it) and server info
 2. The initialized notification should be sent automatically 
 3. Tools/list should return available tools after proper initialization
-4. The server should not return "Server not initialized" errors
+4. A request with an unknown or expired session ID gets HTTP `404`; the client then initializes again (this happens after every server restart)
 
 #### Debugging
 
@@ -860,9 +796,9 @@ curl -X POST http://localhost:8000/mcp \
 
 #### Testing OCR / scanned-document extraction
 
-Traditional OCR (Tesseract) runs **without any API key**. The LLM vision model is
-only a second-level fallback, enabled with `FTMD_MARKITDOWN_ENABLE_LLM=true` and an
-OpenAI key.
+Traditional OCR (Tesseract) runs **without any API key**. With
+`FTMD_MARKITDOWN_ENABLE_LLM=true` the vision model reads scanned pages first and
+Tesseract is the fallback (see [How scanned pages are read](#how-scanned-pages-are-read)).
 
 **Extract a scanned image (OCR):**
 ```bash
@@ -886,7 +822,7 @@ curl -X POST "http://localhost:8000/mcp/tools/file_to_markdown" \
 
 **Extraction behavior:**
 - Text PDFs / Office docs: direct MarkItDown extraction.
-- Scanned PDFs and images: Tesseract OCR (free); the response includes `pages[]` and an `extraction_method` of `ocr` (or `ocr+vision` when the LLM fallback was used).
+- Scanned PDFs and images: read by the vision model and/or Tesseract; the response includes `pages[]` and an `extraction_method` of `vision`, `ocr`, or `ocr+vision` when both engines were used.
 - The response reports `success: false` with a warning if no text could be extracted — it never reports success on empty output.
 
 **LLM Integration Troubleshooting:**
@@ -897,22 +833,26 @@ curl -X POST "http://localhost:8000/mcp/tools/file_to_markdown" \
   - Ensure your API key is valid and has sufficient credits
   - Check that the base URL is correct for Azure OpenAI or custom endpoints
   - Verify environment variable names use the `FTMD_` prefix
+- **Self-hosted model not reached from Docker**:
+  - `localhost` inside the container is the container itself; use `host.docker.internal` (or the host's LAN address) in `FTMD_OPENAI_BASE_URL`
+  - When the model cannot be reached, pages are read by Tesseract instead; the logs show `Vision OCR failed on page N`
 - **Model Not Found**: 
   - Ensure the model name is correct for your OpenAI setup
   - For Azure OpenAI, use your deployment name, not the base model name
   - Verify the model supports vision capabilities for OCR features
 - **OCR Not Working**: 
-  - Check that `FTMD_MARKITDOWN_ENABLE_LLM=true` is set
-  - Verify the PDF actually contains no extractable text (scanned documents)
-  - Look for "Attempting enhanced OCR fallback" messages in logs
+  - Check `metadata.extraction_method`, `pages[].method` and `warnings` in the response: they say which engine read each page and whether pages were skipped
+  - Verify the PDF actually contains no extractable text (OCR only runs for PDFs that yield no text, and for images)
+  - Look for "running OCR fallback" in the logs
 - **Traditional OCR Issues**:
-  - **Pytesseract**: Ensure Tesseract OCR engine is installed on system
-  - **EasyOCR**: May require additional GPU setup for optimal performance
-  - **Low Quality Results**: Tool will automatically fall back to LLM vision analysis
+  - **Pytesseract**: Ensure Tesseract OCR engine is installed on system (it is in the Docker image)
+  - **Wrong or garbled characters**: Set `FTMD_OCR_LANGUAGES` to the document's language(s), e.g. `deu+eng`
+  - **EasyOCR**: Optional alternative; not installed by default because it pulls in PyTorch
+  - **Low Quality Results**: Enable the LLM integration so the vision model reads the pages
 - **OCR Performance**:
-  - Traditional OCR is preferred for cost efficiency (no API costs)
-  - LLM vision analysis activates when OCR yields <50 characters
-  - Processing limited to 5 pages per PDF to manage costs
+  - A vision call takes seconds per page; use the background jobs API for long documents
+  - `FTMD_OCR_STRATEGY=ocr_first` keeps the vision model for pages Tesseract cannot read (≤50 characters)
+  - Processing is limited to `FTMD_OCR_MAX_PAGES` pages per document (default 50)
 
 **Security Considerations:**
 - Never commit API keys to version control
@@ -921,11 +861,11 @@ curl -X POST "http://localhost:8000/mcp/tools/file_to_markdown" \
 - Monitor API usage for unexpected activity
 
 **Cost Considerations:**
-- LLM integration incurs API costs based on usage
-- OCR processing (scanned PDFs) uses more tokens than standard text extraction
-- Image processing typically uses more tokens than text-only operations
+- A self-hosted vision model costs nothing per page; a paid API bills every vision call
+- With the default `vision_first`, each scanned page is one vision call — set `FTMD_OCR_STRATEGY=ocr_first`, `FTMD_VISION_MAX_CALLS_PER_REQUEST` or `FTMD_OCR_MAX_PAGES` to bound paid usage
+- Text PDFs and Office documents never use the vision model
 - Consider using `gpt-4o-mini` for cost-effective processing
-- OCR processing is limited to 5 pages per PDF to manage costs
+- `GET /metrics` and `metadata.vision` in each response report vision calls, tokens and an estimated cost
 - Monitor your usage through the OpenAI dashboard
 
 ### Testing Structure
@@ -948,12 +888,14 @@ The project uses a separated testing approach that mirrors the separation betwee
 
 **Recommended: run the suite with pytest (from the repo root).**
 ```bash
-pip install pytest pytest-asyncio
+pip install -r fastapi_mcp_template/core_test/requirements.txt
 # pytest.ini sets asyncio_mode=auto and the test paths.
 PYTHONPATH=. pytest
 ```
-This runs the tool tests in `tests/` (real extraction, chunking, caching, SSRF)
-and the framework tests in `fastapi_mcp_template/core_test/`.
+This runs the tests in `tests/` (extraction, chunking, caching, OCR engine selection,
+SSRF, MCP protocol, sessions, CORS, API key, limits) and the framework tests in
+`fastapi_mcp_template/core_test/`. No network, Tesseract or LLM is needed; tests for
+a tool are skipped when that tool's dependencies are not installed.
 
 **Via the in-app test runner (dev containers only).** Test endpoints are exposed
 only when `FTMD_DEBUG=true`, and require `X-API-Key` when a key is configured:
@@ -968,9 +910,10 @@ curl -X POST http://localhost:8001/tests/run/test_tools
 
 #### Test API Endpoints
 
-When tests are enabled (`ENABLE_TESTS=true`), the following endpoints are available:
+`GET /tests/status` always exists. In debug mode (`FTMD_DEBUG=true`, with test
+dependencies installed via the `ENABLE_TESTS=true` build argument) these are available
+as well; they require the API key when one is configured:
 
-- `GET /tests/status` - Check if testing is enabled
 - `GET /tests` - List all available tests
 - `POST /tests/run/{test_name}` - Run specific test file
 - `POST /tests/run-all` - Run all tests

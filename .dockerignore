@@ -1,0 +1,19 @@
+# Keep secrets, VCS data and local artifacts out of the build context.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+data/
+.venv/
+.venv-*/
+venv/
+.vscode/
+.idea/
+.pytest_cache/
+**/__pycache__/
+**/*.py[cod]
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

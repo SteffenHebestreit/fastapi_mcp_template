@@ -61,7 +61,7 @@ def test_mcp_initialize_negotiates_version_and_capabilities():
 
         r2 = c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                   "params": {"protocolVersion": "1999-01-01"}})
-        assert r2.json()["result"]["protocolVersion"] == "2024-11-05"  # default when unsupported
+        assert r2.json()["result"]["protocolVersion"] == "2025-11-25"  # newest supported when unsupported
 
 
 def test_mcp_batch_request():
